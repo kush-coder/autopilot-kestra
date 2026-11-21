@@ -1,0 +1,159 @@
+<template>
+    <div class="legend" :class="{center}">
+        <span
+            v-for="item in visible"
+            :key="item.label"
+            class="item"
+            :class="{off: toggledOff.has(item.label)}"
+            @click="toggle(item.label)"
+        >
+            <span :style="swatchStyle(item.color)" />
+            {{ item.displayName ?? categoryLabel(item.label) }} ({{ formatCount(item.count) }})
+        </span>
+
+        <KsTooltip v-if="hidden.length" placement="top">
+            <template #content>
+                <div style="display:flex; flex-direction:column; font-size:var(--ks-font-size-2xs); color:var(--ks-text-secondary); font-variant-numeric:tabular-nums;">
+                    <span
+                        v-for="item in hidden"
+                        :key="item.label"
+                        :style="{display:'flex', alignItems:'center', gap:'6px', whiteSpace:'nowrap', cursor:'pointer', opacity: toggledOff.has(item.label) ? 0.4 : 1}"
+                        @click="toggle(item.label)"
+                    >
+                        <span :style="swatchStyle(item.color)" />
+                        <span style="flex:1;">{{ item.displayName ?? categoryLabel(item.label) }}</span>
+                        <span>{{ formatCount(item.count) }}</span>
+                    </span>
+                </div>
+            </template>
+            <span class="ellipsis" tabindex="0" :aria-label="$t('dashboards.show_all_statuses')">⋯</span>
+        </KsTooltip>
+
+        <span
+            v-if="durationLabel"
+            class="item"
+            :class="{off: toggledOff.has(durationLabel)}"
+            @click="toggle(durationLabel)"
+        >
+            <span class="line" />
+            {{ categoryLabel(durationLabel) }}
+        </span>
+    </div>
+</template>
+
+<script setup lang="ts">
+    import {computed, ref} from "vue"
+    import type {EChartsType} from "echarts/core"
+    import {categoryLabel, KsTooltip} from "@kestra-io/design-system"
+
+    interface ChartLegendItem {
+        label: string;
+        color: string;
+        count: number;
+        displayName?: string;
+        rank?: number;
+    }
+
+    const props = withDefaults(defineProps<{
+        items: ChartLegendItem[];
+        maxVisible?: number;
+        durationLabel?: string;
+        center?: boolean;
+        chart?: {getEchartsInstance: () => EChartsType | null} | null;
+        formatValue?: (value: number) => string;
+        toggledOff?: Set<string>;
+    }>(), {
+        maxVisible: 5,
+        durationLabel: undefined,
+        center: false,
+        chart: null,
+        formatValue: undefined,
+        toggledOff: undefined,
+    })
+
+    const emit = defineEmits<{toggle: [name: string]}>()
+
+    const aggregated = computed<ChartLegendItem[]>(() => {
+        const byLabel = new Map<string, ChartLegendItem>()
+        for (const item of props.items) {
+            const entry = byLabel.get(item.label) ?? {...item, count: 0}
+            entry.count += item.count || 0
+            byLabel.set(item.label, entry)
+        }
+        return [...byLabel.values()].sort((a, b) => (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) || b.count - a.count)
+    })
+
+    const visible = computed(() => aggregated.value.slice(0, props.maxVisible))
+    const hidden = computed(() => aggregated.value.slice(props.maxVisible))
+
+    const internalToggledOff = ref(new Set<string>())
+    const toggledOff = computed(() => props.toggledOff ?? internalToggledOff.value)
+
+    function toggle(name: string) {
+        if (!props.toggledOff) {
+            const next = new Set(internalToggledOff.value)
+            if (next.has(name)) next.delete(name)
+            else next.add(name)
+            internalToggledOff.value = next
+        }
+        props.chart?.getEchartsInstance?.()?.dispatchAction({type: "legendToggleSelect", name})
+        emit("toggle", name)
+    }
+
+    const formatCount = (count: number) => props.formatValue?.(count) ?? String(count)
+
+    const swatchStyle = (color: string) => ({
+        width: "10px",
+        height: "10px",
+        borderRadius: "2px",
+        backgroundColor: color,
+        flexShrink: 0,
+        display: "inline-block",
+    })
+</script>
+
+<style scoped>
+    .legend {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--ks-spacing-3);
+        margin-bottom: var(--ks-spacing-2);
+        font-size: var(--ks-font-size-2xs);
+        color: var(--ks-text-secondary);
+        font-variant-numeric: tabular-nums;
+
+        &.center {
+            justify-content: center;
+        }
+
+        .item {
+            display: inline-flex;
+            align-items: center;
+            gap: var(--ks-spacing-2);
+            white-space: nowrap;
+            cursor: pointer;
+            transition: opacity var(--ks-duration-fast) ease;
+
+            &.off {
+                opacity: 0.4;
+            }
+        }
+
+        .line {
+            width: 10px;
+            height: 2px;
+            flex-shrink: 0;
+            border-radius: var(--ks-radius-sm);
+            background: var(--ks-chart-duration);
+        }
+
+        .ellipsis {
+            display: inline-flex;
+            align-items: center;
+            line-height: 1;
+            color: var(--ks-text-primary);
+            cursor: pointer;
+        }
+    }
+</style>

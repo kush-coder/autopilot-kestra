@@ -1,0 +1,111 @@
+<template>
+    <ElInput
+        ref="elInputRef"
+        v-model="model"
+        class="ks-search"
+        :class="{'ks-search--borderless': borderless}"
+        v-bind="({...filteredProps(), ...$attrs} as InputProps)"
+        @change="emit('change', $event)"
+    >
+        <template #prefix>
+            <slot name="prefix">
+                <Magnify class="ks-search__icon" />
+            </slot>
+        </template>
+        <template v-if="$slots.suffix" #suffix>
+            <slot name="suffix" />
+        </template>
+    </ElInput>
+</template>
+
+<script setup lang="ts">
+    import type {NativeAttributes} from "../../utils/nativeAttributes"
+    import {ref, type HTMLAttributes} from "vue"
+    import {ElInput, type InputProps} from "element-plus"
+    import Magnify from "vue-material-design-icons/Magnify.vue"
+    import {usePassedProps} from "../../utils/filteredProps"
+
+    defineOptions({inheritAttrs: false})
+
+    const elInputRef = ref<InstanceType<typeof ElInput>>()
+
+    defineExpose({
+        focus: () => elInputRef.value?.focus(),
+        blur: () => elInputRef.value?.blur(),
+        select: () => elInputRef.value?.select(),
+    })
+
+    const model = defineModel<string>({default: ""})
+
+    type KsSearchProps = Omit<InputProps, "modelValue"> & {
+        /** Drop the border, shadow and background so the field sits flush in a container that draws them (the global search). */
+        borderless?: boolean
+    }
+
+    const props = defineProps<KsSearchProps & /* @vue-ignore */ Omit<NativeAttributes<HTMLAttributes>, keyof KsSearchProps>>()
+
+    const emit = defineEmits<{
+        change: [value: string | number]
+    }>()
+
+    defineSlots<{
+        prefix?(): unknown
+        suffix?(): unknown
+    }>()
+
+    const filteredProps = usePassedProps(props, ["borderless"])
+</script>
+
+<style>
+    .ks-search {
+        width: 100%;
+
+        & .kel-input__wrapper {
+            height: 32px;
+            gap: 8px;
+            border-radius: 8px;
+            background-color: var(--ks-bg-input);
+            border: 1px solid var(--ks-border-strong);
+            box-shadow: 0px 1px 4px 0px var(--ks-shadow-element);
+            transition: border-color 0.2s ease;
+
+            &:hover {
+                border: 1px solid var(--ks-border-subtle);
+                box-shadow: 0px 1px 4px 0px var(--ks-shadow-element);
+            }
+
+            &.is-focus,
+            &.is-focus:hover {
+                border-color: var(--ks-border-focus);
+                box-shadow: 0px 1px 4px 0px var(--ks-shadow-element);
+            }
+        }
+
+        & .kel-input__prefix,
+        & .kel-input__suffix {
+            display: inline-flex;
+            align-items: center;
+        }
+
+        & .kel-input__inner {
+            font-size: var(--ks-font-size-sm);
+        }
+
+        &.ks-search--borderless .kel-input__wrapper {
+            &, &:hover, &.is-focus, &.is-focus:hover {
+                border: 0;
+                box-shadow: none;
+            }
+
+            padding: var(--ks-spacing-2) var(--ks-spacing-4);
+            background-color: transparent;
+            border-radius: 0;
+        }
+
+        & .ks-search__icon {
+            display: inline-flex;
+            color: var(--ks-icon-default);
+            font-size: var(--ks-font-size-sm);
+        }
+    }
+</style>

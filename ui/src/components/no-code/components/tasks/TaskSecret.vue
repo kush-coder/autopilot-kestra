@@ -1,0 +1,35 @@
+<template>
+    <div class="wrapper">
+        <KsPassword
+            v-model="modelValue"
+            :placeholder="root ?? ''"
+        />
+    </div>
+</template>
+
+<script lang="ts" setup>
+    import {Schema} from "./getTaskComponent"
+
+    defineOptions({inheritAttrs: false})
+
+    defineProps<{
+        disabled?: boolean;
+        schema?: Schema;
+        root?: string;
+        task?: Record<string, unknown>;
+    }>()
+
+    const modelValue = defineModel<string>({default: ""})
+</script>
+
+<style scoped>
+.wrapper {
+    display: flex;
+    align-items: stretch;
+    justify-content: stretch;
+    border-radius: var(--ks-radius-base);
+    border: 1px solid var(--ks-border-default);
+    width: 100%;
+    --ks-input-border-color: transparent;
+}
+</style>

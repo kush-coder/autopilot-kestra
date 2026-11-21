@@ -1,0 +1,74 @@
+<template>
+    <KsTooltip
+        v-if="tooltip"
+        :content="tooltip"
+        :rawContent="true"
+        v-bind="placement ? {placement} : {}"
+        :enterable="false"
+    >
+        <ElIcon
+            v-bind="{...filteredProps(), ...$attrs}"
+            :size="resolvedSize"
+            :class="{'ks-icon--sized': resolvedSize !== undefined}"
+            @click="emit('click', $event)"
+        >
+            <template v-if="$slots.default" #default>
+                <slot />
+            </template>
+        </ElIcon>
+    </KsTooltip>
+    <ElIcon
+        v-else
+        v-bind="{...filteredProps(), ...$attrs}"
+        :size="resolvedSize"
+        :class="{'ks-icon--sized': resolvedSize !== undefined}"
+        @click="emit('click', $event)"
+    >
+        <template v-if="$slots.default" #default>
+            <slot />
+        </template>
+    </ElIcon>
+</template>
+
+<script setup lang="ts">
+    import type {NativeAttributes} from "../../utils/nativeAttributes"
+    import {computed, type HTMLAttributes} from "vue"
+    import {ElIcon, type Placement} from "element-plus"
+    import {useFilteredProps} from "../../utils/filteredProps"
+
+    defineOptions({inheritAttrs: false})
+
+    type IconSizeToken = "xs" | "sm" | "base" | "lg" | "xl"
+    const SIZE_TOKENS: readonly IconSizeToken[] = ["xs", "sm", "base", "lg", "xl"] as const
+
+    const props = defineProps<{
+        size?: number | IconSizeToken
+        color?: string
+        tooltip?: string
+        placement?: Placement
+    } & /* @vue-ignore */ NativeAttributes<HTMLAttributes>>()
+
+    const emit = defineEmits<{
+        click: [evt: MouseEvent]
+    }>()
+
+    defineSlots<{
+        default?(): unknown
+    }>()
+
+    const filteredProps = useFilteredProps(props, ["size"])
+
+    const resolvedSize = computed(() => {
+        const s = props.size
+        if (typeof s === "string" && (SIZE_TOKENS as readonly string[]).includes(s)) {
+            return `var(--ks-icon-size-${s})`
+        }
+        return s
+    })
+</script>
+
+<style>
+    .ks-icon--sized {
+        --ks-material-icon-size: 1em;
+    }
+</style>

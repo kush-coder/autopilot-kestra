@@ -1,0 +1,801 @@
+<template>
+    <div data-component="FILENAME_PLACEHOLDER" :style="{'--execution-banner-height': `${bannerHeight}px`}">
+        <ExecutionSummaryCard v-if="props.showBanner && execution" v-model:height="bannerHeight" :execution />
+        <div ref="inlineLogsTarget" />
+        <KsDialog
+            v-model="fullscreenModalOpen"
+            :title="$t('logs')"
+            data-test="logs-fullscreen-dialog"
+            fill
+            fullscreen
+            @opened="finishLogScrollRestore"
+            @closed="finishLogScrollRestore"
+        >
+            <div ref="fullscreenLogsTarget" class="fullscreen-logs-container" />
+        </KsDialog>
+
+        <Teleport v-if="logsTarget" :to="logsTarget">
+            <LoopIterationsNotice v-if="!merged" kind="logs" />
+            <KSFilter
+                :configuration="logExecutionsFilter"
+                :tableOptions="{
+                    chart: {shown: false},
+                    columns: {shown: false},
+                    refresh: {shown: true, callback: refreshLogs}
+                }"
+                @search="filter = $event"
+                @filter="applyLevelFilter"
+            />
+            <div class="logs-toolbar" data-test="logs-toolbar">
+                <div class="logs-toolbar__left">
+                    <KsSegmented
+                        v-if="hasLoopIterations"
+                        v-model="selectedMode"
+                        :options="modeOptions"
+                        size="small"
+                        :aria-label="$t('logs_view.loop.mode-label')"
+                        data-test="logs-mode-switch"
+                    />
+                    <template v-for="logLevel in (merged ? [] : currentLevelOrLower)" :key="logLevel">
+                        <LogLevelNavigator
+                            v-if="countByLogLevel[logLevel] > 0"
+                            :cursorIdx="cursorLogLevel === logLevel ? cursorIdxForLevel : undefined"
+                            :level="logLevel"
+                            :totalCount="countByLogLevel[logLevel]"
+                            @previous="previousLogForLevel(logLevel)"
+                            @next="nextLogForLevel(logLevel)"
+                            @close="logCursor = undefined"
+                        />
+                    </template>
+                    <KsButton v-if="!merged" class="logs-toolbar__text-btn" @click="expandCollapseAll()" :disabled="raw_view" :icon="logDisplayButtonIcon">
+                        {{ logDisplayButtonText }}
+                    </KsButton>
+                    <KsTooltip v-if="!merged" :content="!raw_view ? $t('logs_view.raw_details') : $t('logs_view.compact_details')">
+                        <KsButton class="logs-toolbar__text-btn" @click="toggleViewType" :icon="logViewTypeButtonIcon">
+                            {{ !raw_view ? $t('logs_view.raw') : $t('logs_view.compact') }}
+                        </KsButton>
+                    </KsTooltip>
+                </div>
+                <div class="logs-toolbar__actions">
+                    <Restart v-if="executionsStore.execution && !isMobile" :execution="executionsStore.execution" />
+                    <LogDisplaySettings />
+                    <KsButton
+                        square
+                        type="default"
+                        size="default"
+                        data-test="logs-fullscreen-toggle"
+                        :icon="fullscreenModalOpen ? FullscreenExit : Fullscreen"
+                        :aria-label="fullscreenModalOpen ? $t('logs_view.exit_fullscreen') : $t('logs_view.fullscreen')"
+                        :aria-pressed="fullscreenModalOpen"
+                        :tooltip="fullscreenModalOpen ? $t('logs_view.exit_fullscreen') : $t('logs_view.fullscreen')"
+                        @click="toggleFullscreenModal"
+                    />
+                    <KsButton square type="default" size="default" :disabled="merged" :icon="Download" :aria-label="$t('download logs')" :tooltip="$t('download logs')" @click="downloadContent()" />
+                    <KsButton square type="default" size="default" :disabled="merged" :icon="ContentCopy" :aria-label="$t('copy logs')" :tooltip="$t('copy logs')" @click="copyAllLogs()" />
+                </div>
+            </div>
+
+            <LoopMergedLogs
+                v-if="merged"
+                ref="mergedLogs"
+                :levelParams="mergedLevelParams"
+                :running="isExecutionRunning"
+                :filter="filter"
+                :fullHeight="fullscreenModalOpen"
+            />
+            <TaskRunDetails
+                v-else-if="!raw_view"
+                ref="logs"
+                :levelFilter="effectiveLevelValue"
+                :excludeMetas="(['namespace', 'flowId', 'taskId', 'executionId'] as (keyof Log)[])"
+                :filter="filter"
+                :taskRunId="routeTaskRunId"
+                :levelToHighlight="cursorLogLevel"
+                @log-cursor="logCursor = $event"
+                :logCursor="logCursor"
+                @opened-taskruns-count="openedTaskrunsCount = $event"
+                @log-indices-by-level="setLogIndicesByLevel"
+                :targetFlow="executionsStore.flow"
+                :showProgressBar="false"
+                :fullHeight="fullscreenModalOpen"
+                @scroll.capture.passive="rememberLogScroll"
+                @scroller-update="restoreLogScroll"
+            />
+            <KsCard
+                v-else
+                class="attempt-wrapper"
+                :class="{'fullscreen-attempt-wrapper': fullscreenModalOpen}"
+                :bodyStyle="fullscreenModalOpen ? FULLSCREEN_CARD_BODY_STYLE : undefined"
+                style="--kel-card-padding: 0"
+            >
+                <KsNoData
+                    v-if="logsLoaded && !logsLoading && temporalLogs.length === 0"
+                    :title="$t('no_logs_data_title')"
+                    :description="$t('no_logs_data_description')"
+                />
+                <DynamicScroller
+                    v-if="temporalLogs.length > 0"
+                    ref="logScroller"
+                    :items="temporalLogs"
+                    :minItemSize="50"
+                    keyField="uid"
+                    class="log-lines temporal"
+                    data-test="logs-scroller"
+                    data-scroll-key="raw-logs"
+                    :class="{'fullscreen-logs': fullscreenModalOpen}"
+                    :prerender="20"
+                    @scroll.capture.passive="rememberLogScroll"
+                    :emitUpdate="true"
+                    @update="restoreLogScroll"
+                    @resize="restoreLogScroll"
+                    @visible="restoreLogScroll"
+                >
+                    <template #default="{item, active}">
+                        <DynamicScrollerItem
+                            class="entry"
+                            :item="asLog(item)"
+                            :active="active"
+                            :data-index="asLog(item).index"
+                            :key="asLog(item).uid"
+                        >
+                            <LogLine
+                                @click="logCursor = asLog(item).index.toString()"
+                                class="line"
+                                :dimmed="!!cursorLogLevel && cursorLogLevel !== asLog(item).level"
+                                :cursor="asLog(item).index.toString() === logCursor"
+                                :excludeMetas="(['namespace', 'flowId', 'executionId'] as (keyof Log)[])"
+                                :level="effectiveLevelValue?.value as LogUtils.LevelKey"
+                                :filter="filter"
+                                :log="asLog(item)"
+                            />
+                        </DynamicScrollerItem>
+                    </template>
+                </DynamicScroller>
+            </KsCard>
+        </Teleport>
+    </div>
+</template>
+
+<script setup lang="ts">
+    import {computed, nextTick, ref, watch, useTemplateRef, onUnmounted, type CSSProperties} from "vue"
+    import {useRoute} from "vue-router"
+    import {useIsMobile} from "../../composables/useIsMobile"
+    import {useI18n} from "vue-i18n"
+    import {useLogExecutionsFilter} from "../filter/configurations/logExecutionsFilter"
+    import TaskRunDetails from "../logs/TaskRunDetails.vue"
+    import ExecutionSummaryCard from "./components/ExecutionSummaryCard.vue"
+    import LoopMergedLogs from "./LoopMergedLogs.vue"
+    import LogDisplaySettings from "../logs/LogDisplaySettings.vue"
+    import Download from "vue-material-design-icons/Download.vue"
+    import ContentCopy from "vue-material-design-icons/ContentCopy.vue"
+    import Fullscreen from "vue-material-design-icons/Fullscreen.vue"
+    import FullscreenExit from "vue-material-design-icons/FullscreenExit.vue"
+    import UnfoldMoreHorizontal from "vue-material-design-icons/UnfoldMoreHorizontal.vue"
+    import UnfoldLessHorizontal from "vue-material-design-icons/UnfoldLessHorizontal.vue"
+    import ViewList from "vue-material-design-icons/ViewList.vue"
+    import ViewGrid from "vue-material-design-icons/ViewGrid.vue"
+    import LogLevelNavigator from "../logs/LogLevelNavigator.vue"
+    import {DynamicScroller, DynamicScrollerItem, type DynamicScrollerExposed} from "../../utils/virtualScroller"
+    import "vue-virtual-scroller/dist/vue-virtual-scroller.css"
+
+    import * as Utils from "../../utils/utils"
+    import {useToast} from "../../utils/toast"
+    import LogLine from "../logs/LogLine.vue"
+    import Restart from "./overview/components/actions/Restart.vue"
+    import LoopIterationsNotice from "./LoopIterationsNotice.vue"
+    import * as LogUtils from "../../utils/logs"
+    import {useExecutionsStore} from "../../stores/executions"
+    import type {Log} from "../../stores/logs"
+    import type {LogEntry} from "@kestra-io/kestra-sdk"
+    import {KsFilter as KSFilter} from "@kestra-io/design-system"
+    import {storageKeys} from "../../utils/constants"
+    import {flowHasLoop} from "../../utils/loopLogScope"
+    import {routeQueryToQueryFilters} from "../../utils/queryFilters"
+    import {
+        hasUnsupportedRouteLevelComparator,
+        levelToRequestParams,
+        normalizeRouteLevelFilter,
+        readAppliedLevelFilter,
+        readRouteLevelFilter,
+        State,
+        type AppliedFilter,
+        type LevelFilterValue,
+    } from "@kestra-io/design-system"
+    import {useRouteFilterPolicy} from "@kestra-io/design-system"
+    function distinctFilter(value: string, index: number, array: string[]) {
+        return array.indexOf(value) === index
+    }
+
+    interface TemporalLog extends LogEntry {
+        index: number
+        uid: string
+    }
+
+    const FULLSCREEN_CARD_BODY_STYLE: CSSProperties = {
+        display: "flex",
+        flexDirection: "column",
+        flex: "1",
+        minHeight: "0",
+    }
+
+    // Cast helper for DynamicScroller slot items which lose type info
+    function asLog(item: unknown): TemporalLog {
+        return item as TemporalLog
+    }
+
+    const {t} = useI18n()
+    const isMobile = useIsMobile()
+    const toast = useToast()
+
+
+    const props = withDefaults(defineProps<{
+        playground?: boolean
+        showBanner?: boolean
+    }>(), {
+        playground: false,
+        showBanner: false,
+    })
+
+    const executionsStore = useExecutionsStore()
+    const execution = computed(() => executionsStore.execution)
+
+    const bannerHeight = ref(0)
+
+    // The kind this execution's logs belong to, or undefined for NORMAL (the backend default).
+    const executionKind = computed<string | undefined>(() => {
+        const kind = props.playground
+            ? "PLAYGROUND"
+            : (executionsStore.execution as {kind?: string} | undefined)?.kind
+        return kind && kind !== "NORMAL" ? kind : undefined
+    })
+
+    // Per-execution log views default to NORMAL kind on the backend; surface this execution's own
+    // kind when it isn't NORMAL (e.g. PLAYGROUND) so its logs still load.
+    const kindParams = computed<Record<string, string>>(() => {
+        const params: Record<string, string> = {}
+        if (executionKind.value) {
+            params["filters[kind][IN]"] = executionKind.value
+        }
+        return params
+    })
+
+    const route = useRoute()
+
+    type LogsMode = "execution" | "merged"
+
+    const hasLoopIterations = computed(() => !props.playground && flowHasLoop(executionsStore.flow))
+    const modeOverride = ref<LogsMode>()
+    const mode = computed<LogsMode>(() => modeOverride.value ?? (hasLoopIterations.value ? "merged" : "execution"))
+    const merged = computed(() => hasLoopIterations.value && mode.value === "merged")
+    const selectedMode = computed({
+        get: () => mode.value,
+        set: (value: string) => {
+            modeOverride.value = value as LogsMode
+        },
+    })
+    const modeOptions = computed(() => [
+        {label: t("logs_view.loop.this-execution"), value: "execution"},
+        {label: t("logs_view.loop.with-iterations"), value: "merged"},
+    ])
+    const logFilters = computed(() => routeQueryToQueryFilters({...levelToRequestParams(effectiveLevelValue.value), ...kindParams.value}))
+
+    const logExecutionsFilter = useLogExecutionsFilter(() => props.playground, () => executionKind.value)
+    const defaultLogLevel = computed(
+        () => localStorage.getItem(storageKeys.DEFAULT_LOG_LEVEL) || "INFO",
+    )
+
+    const levelInUrlAtMount = readRouteLevelFilter(route.query) !== undefined
+
+    const {
+        routeValue: routeLevel,
+        effectiveValue: effectiveLevel,
+        syncFromAppliedFilters,
+        setRouteValue: setRouteLevel,
+    } = useRouteFilterPolicy({
+        defaultValue: () => ({value: merged.value ? "ERROR" : defaultLogLevel.value, direction: "min" as const}),
+        applyDefaultIfMissing: () => true,
+        fallbackValue: () => ({value: "TRACE", direction: "min" as const}),
+        readFromRoute: readRouteLevelFilter,
+        writeToRoute: normalizeRouteLevelFilter,
+        hasUnsupportedRouteValue: hasUnsupportedRouteLevelComparator,
+        readFromAppliedFilters: readAppliedLevelFilter,
+    })
+
+    // Narrow the type from the composable's union return type
+    const effectiveLevelValue = computed(() => effectiveLevel.value as LevelFilterValue | undefined)
+    const routeLevelValue = computed(() => routeLevel.value as LevelFilterValue | undefined)
+
+    const ERRORS_ONLY: LevelFilterValue = {value: "ERROR", direction: "min"}
+    const defaultLevelValue = (): LevelFilterValue => ({value: defaultLogLevel.value, direction: "min"})
+    const levelPicked = ref(levelInUrlAtMount)
+    let levelBeforeErrorsOnly: LevelFilterValue | undefined = !levelInUrlAtMount && merged.value ? defaultLevelValue() : undefined
+    const mergedUsesDefaultLevel = computed(() => merged.value && !levelPicked.value)
+    const mergedLevelParams = computed(() => levelToRequestParams(mergedUsesDefaultLevel.value ? ERRORS_ONLY : effectiveLevelValue.value))
+
+    watch(merged, (isMerged) => {
+        if (levelPicked.value) return
+        if (isMerged) {
+            levelBeforeErrorsOnly = routeLevelValue.value ?? defaultLevelValue()
+            if (routeLevelValue.value?.value !== ERRORS_ONLY.value) setRouteLevel(ERRORS_ONLY)
+        } else if (levelBeforeErrorsOnly) {
+            setRouteLevel(levelBeforeErrorsOnly)
+            levelBeforeErrorsOnly = undefined
+        }
+    })
+
+    function applyLevelFilter(filters: AppliedFilter[]) {
+        const applied = readAppliedLevelFilter(filters)
+        if (routeLevelValue.value !== undefined && JSON.stringify(applied) !== JSON.stringify(routeLevelValue.value)) {
+            levelPicked.value = true
+            levelBeforeErrorsOnly = undefined
+        }
+        syncFromAppliedFilters(filters)
+    }
+
+    const filter = ref<string | undefined>(undefined)
+    const routeTaskRunId = computed(() => {
+        const value = route.query["filters[taskRunId][EQUALS]"]
+        return typeof value === "string" && value ? value : undefined
+    })
+    const openedTaskrunsCount = ref(0)
+    const raw_view = ref((localStorage.getItem(storageKeys.LOGS_VIEW_TYPE) ?? "false").toLowerCase() === "true")
+    const emptyLogIndicesByLevel = () =>
+        Object.fromEntries(LogUtils.levelOrLower(undefined).map((level) => [level, [] as string[]]))
+    const logIndicesByLevel = ref<Record<string, string[]>>(emptyLogIndicesByLevel())
+    const setLogIndicesByLevel = (indices: Record<string, string[]>) => {
+        logIndicesByLevel.value = {...emptyLogIndicesByLevel(), ...indices}
+    }
+    const logCursor = ref<string | undefined>(undefined)
+    const logsLoading = ref(false)
+    // The empty-state placeholder is only right once a fetch came back empty: while an execution is
+    // still streaming, no logs yet means "not there yet", not "none".
+    const logsLoaded = ref(false)
+    const fullscreenModalOpen = ref(false)
+
+    const logs = useTemplateRef<InstanceType<typeof TaskRunDetails>>("logs")
+    const mergedLogs = useTemplateRef<InstanceType<typeof LoopMergedLogs>>("mergedLogs")
+    const logScroller = useTemplateRef<DynamicScrollerExposed>("logScroller")
+    const inlineLogsTarget = useTemplateRef<HTMLElement>("inlineLogsTarget")
+    const fullscreenLogsTarget = useTemplateRef<HTMLElement>("fullscreenLogsTarget")
+    const preservedLogScrollPositions = new Map<string, number>()
+    let pendingLogScrollPositions = new Map<string, number>()
+    let fullscreenTransition = false
+    let clearPendingAfterRestore = false
+    const logsTarget = computed(() =>
+        fullscreenModalOpen.value
+            ? fullscreenLogsTarget.value ?? inlineLogsTarget.value
+            : inlineLogsTarget.value,
+    )
+
+    watch(fullscreenModalOpen, () => {
+        fullscreenTransition = true
+        clearPendingAfterRestore = false
+        pendingLogScrollPositions = new Map(preservedLogScrollPositions)
+        restoreLogScroll()
+    }, {flush: "sync"})
+    watch(logsTarget, restoreLogScroll, {flush: "post"})
+
+    const executionId = computed(() => executionsStore.execution?.id)
+    watch(executionId, () => {
+        preservedLogScrollPositions.clear()
+        pendingLogScrollPositions.clear()
+    })
+
+    filter.value = (route.query.q as string) || undefined
+
+    const logsSSE = ref<EventSource | undefined>(undefined)
+    let sseBuffer: LogEntry[] = []
+    let sseFlushTimer: ReturnType<typeof setTimeout> | undefined
+
+    const flushSseBuffer =  () => {
+        sseFlushTimer = undefined
+        if (!sseBuffer.length) return
+        executionsStore.appendLogs(sseBuffer)
+        sseBuffer = []
+        logsLoading.value = false
+    }
+
+    const closeLogsSSE = () => {
+        if (logsSSE.value) {
+            logsSSE.value.close()
+            logsSSE.value = undefined
+        }
+        if (sseFlushTimer) {
+            clearTimeout(sseFlushTimer)
+            sseFlushTimer = undefined
+        }
+        sseBuffer = []
+        logsLoading.value = false
+    }
+
+    const streamLogs = () => {
+        closeLogsSSE()
+        executionsStore.resetLogs()
+        logsLoaded.value = false
+        logsLoading.value = true
+        executionsStore.followLogs({
+            id: executionId.value!,
+            params: {...levelToRequestParams(effectiveLevelValue.value), ...kindParams.value},
+        }).then((sse: EventSource) => {
+            logsSSE.value = sse
+            sse.onmessage = (event: MessageEvent) => {
+                // ignore the initial "start" keep-alive event
+                if (event.lastEventId === "start") return
+                sseBuffer.push(JSON.parse(event.data))
+                if (!sseFlushTimer) {
+                    sseFlushTimer = setTimeout(flushSseBuffer, 200)
+                }
+            }
+            // Close on error: without this, EventSource auto-reconnects (~every 3s)
+            // and each reconnect opens a fresh server-side log-follow stream whose
+            // Netty direct buffers are not promptly reclaimed, leaking off-heap
+            // memory over time. See kestra-io/kestra#16982.
+            sse.onerror = () => {
+                closeLogsSSE()
+            }
+        }).catch(() => {
+            logsLoading.value = false
+        })
+    }
+
+    const refreshTemporalLogs = () => {
+        if (!executionId.value) return
+        const currentState = executionsStore.execution?.state?.current
+        if (currentState && State.isRunning(currentState)) {
+            streamLogs()
+        } else {
+            closeLogsSSE()
+            executionsStore.resetLogs()
+            logsLoading.value = false
+            logsLoaded.value = false
+            loadLogs()
+        }
+    }
+
+    const isExecutionRunning = computed(() => {
+        const current = executionsStore.execution?.state?.current
+        return !!current && State.isRunning(current)
+    })
+
+    const streamsRawLogs = computed(() => raw_view.value && !merged.value)
+
+    watch(
+        [executionId, isExecutionRunning, streamsRawLogs],
+        ([id, , isRaw]) => {
+            if (!id || !isRaw) {
+                closeLogsSSE()
+                return
+            }
+            refreshTemporalLogs()
+        },
+        {immediate: true},
+    )
+
+    watch(routeLevel, () => {
+        if (streamsRawLogs.value && executionId.value) {
+            refreshTemporalLogs()
+        }
+    })
+
+    onUnmounted(closeLogsSSE)
+
+    watch(logCursor, (newValue) => {
+        if (newValue === undefined) {
+            return
+        }
+        if (raw_view.value) {
+            scrollToLog(newValue)
+        } else {
+            logs.value?.scrollToLog?.(newValue)
+        }
+        nextTick(() => requestAnimationFrame(() => {
+            const selected = [...document.querySelectorAll<HTMLElement>(".log-wrapper .line.selected")]
+                .find((line) => line.getBoundingClientRect().top > -10000)
+            selected?.scrollIntoView({block: "center", behavior: "smooth"})
+        }))
+    })
+
+    // computed
+    const temporalLogs = computed(() => {
+        const logResults = [...executionsStore.reusedLogsOf(executionId.value, effectiveLevelValue.value), ...executionsStore.logs]
+
+        if (!logResults.length) {
+            return []
+        }
+
+        const filtered = logResults.filter(log => {
+            if (routeTaskRunId.value && log.taskRunId !== routeTaskRunId.value) return false
+            if (!filter.value) return true
+            return log.message?.toLowerCase().includes(filter.value.toLowerCase())
+        })
+
+        return filtered.map((logLine, index) => ({
+            ...logLine,
+            index,
+            uid: `${logLine.taskRunId ?? ""}-${logLine.attemptNumber ?? 0}-${logLine.timestamp}-${index}`,
+        }))
+    })
+
+    const logDisplayButtonText = computed(() =>
+        openedTaskrunsCount.value === 0 ? t("expand all") : t("collapse all"),
+    )
+
+    const logDisplayButtonIcon = computed(() =>
+        openedTaskrunsCount.value === 0 ? UnfoldMoreHorizontal : UnfoldLessHorizontal,
+    )
+
+    const logViewTypeButtonIcon = computed(() =>
+        raw_view.value ? ViewGrid : ViewList,
+    )
+
+    const currentLevelOrLower = computed(() =>
+        LogUtils.levelOrLower(effectiveLevelValue.value?.direction === "min" ? effectiveLevelValue.value.value as LogUtils.LevelKey : undefined),
+    )
+
+    const countByLogLevel = computed(() =>
+        Object.fromEntries(
+            Object.entries(viewTypeAwareLogIndicesByLevel.value).map(([level, indices]) => [level, (indices as string[]).length]),
+        ),
+    )
+
+    const cursorLogLevel = computed(() =>
+        Object.entries(viewTypeAwareLogIndicesByLevel.value).find(([, indices]) => (indices as string[]).includes(logCursor.value as string))?.[0],
+    )
+
+    const cursorIdxForLevel = computed(() =>
+        (viewTypeAwareLogIndicesByLevel.value?.[cursorLogLevel.value as string] as string[] | undefined)
+            ?.toSorted(sortLogsByViewOrder)
+            ?.indexOf(logCursor.value as string),
+    )
+
+    const temporalViewLogIndicesByLevel = computed(() => {
+        const result: Record<string, string[]> = temporalLogs.value.reduce((acc: Record<string, string[]>, item: TemporalLog) => {
+            if (item.level) {
+                ;(acc[item.level] ??= []).push(item.index.toString())
+            }
+            return acc
+        }, {})
+        LogUtils.levelOrLower(undefined).forEach((level) => {
+            if (!result[level]) {
+                result[level] = []
+            }
+        })
+        return result
+    })
+
+    const viewTypeAwareLogIndicesByLevel = computed(() =>
+        raw_view.value ? temporalViewLogIndicesByLevel.value : logIndicesByLevel.value,
+    )
+
+    // methods
+    function loadLogs() {
+        if (logsLoading.value) return
+        logsLoading.value = true
+        executionsStore.loadLogs({
+            executionId: executionId.value!,
+            filters: logFilters.value,
+        }).finally(() => {
+            logsLoading.value = false
+            logsLoaded.value = true
+        })
+    }
+
+    function refreshLogs() {
+        if (merged.value) mergedLogs.value?.refresh()
+        else loadLogs()
+    }
+
+    function downloadContent() {
+        executionsStore.downloadLogsFile({
+            executionId: executionId.value!,
+            filters: logFilters.value,
+        })
+    }
+
+    function copyAllLogs() {
+        executionsStore.downloadLogs({
+            executionId: executionId.value!,
+            filters: logFilters.value,
+        }).then((response: unknown) => {
+            Utils.copy(response as string)
+            toast.success(t("logs_copied"))
+        })
+    }
+
+    function expandCollapseAll() {
+        if (logs.value?.toggleExpandCollapseAll) {
+            logs.value.toggleExpandCollapseAll()
+        }
+    }
+
+    function toggleViewType() {
+        logCursor.value = undefined
+        preservedLogScrollPositions.clear()
+        pendingLogScrollPositions.clear()
+        raw_view.value = !raw_view.value
+        localStorage.setItem(storageKeys.LOGS_VIEW_TYPE, String(raw_view.value))
+    }
+
+    function sortLogsByViewOrder(a: string, b: string): number {
+        const aSplit = a.split("/")
+        const taskRunIndexA = aSplit?.[0]
+        const bSplit = b.split("/")
+        const taskRunIndexB = bSplit?.[0]
+        if (taskRunIndexA === undefined) {
+            return taskRunIndexB === undefined ? 0 : -1
+        }
+        if (taskRunIndexB === undefined) {
+            return 1
+        }
+        if (taskRunIndexA === taskRunIndexB) {
+            return sortLogsByViewOrder(aSplit.slice(1).join("/"), bSplit.slice(1).join("/"))
+        }
+        return Number.parseInt(taskRunIndexA) - Number.parseInt(taskRunIndexB)
+    }
+
+    function previousLogForLevel(level: string) {
+        const logIndicesForLevel = viewTypeAwareLogIndicesByLevel.value[level]
+        if (logCursor.value === undefined) {
+            logCursor.value = logIndicesForLevel?.[logIndicesForLevel.length - 1]
+            return
+        }
+        const sortedIndices = [...logIndicesForLevel, logCursor.value].filter(distinctFilter).sort(sortLogsByViewOrder)
+        logCursor.value = sortedIndices?.[sortedIndices.indexOf(logCursor.value) - 1] ?? sortedIndices[sortedIndices.length - 1]
+    }
+
+    function nextLogForLevel(level: string) {
+        const logIndicesForLevel = viewTypeAwareLogIndicesByLevel.value[level]
+        if (logCursor.value === undefined) {
+            logCursor.value = logIndicesForLevel?.[0]
+            return
+        }
+        const sortedIndices = [...logIndicesForLevel, logCursor.value].filter(distinctFilter).sort(sortLogsByViewOrder)
+        logCursor.value = sortedIndices?.[sortedIndices.indexOf(logCursor.value) + 1] ?? sortedIndices[0]
+    }
+
+    function scrollToLog(index: string) {
+        logScroller.value?.scrollToItem(Number(index))
+    }
+
+    function rememberLogScroll(event: Event) {
+        const scroller = event.target as HTMLElement
+        const key = scroller.dataset.scrollKey
+        if (key && scroller.isConnected && scroller.clientHeight && scroller.scrollHeight > scroller.clientHeight && !pendingLogScrollPositions.has(key)) {
+            preservedLogScrollPositions.set(key, scroller.scrollTop)
+        }
+    }
+
+    function restoreLogScroll() {
+        if (!pendingLogScrollPositions.size) return
+        nextTick(applyPendingLogScrollPositions)
+    }
+
+    function applyPendingLogScrollPositions() {
+        const target = fullscreenModalOpen.value ? fullscreenLogsTarget.value : inlineLogsTarget.value
+        let visibleScrollersReady = true
+        for (const scroller of target?.querySelectorAll<HTMLElement>("[data-scroll-key]") ?? []) {
+            const key = scroller.dataset.scrollKey!
+            const scrollTop = pendingLogScrollPositions.get(key)
+            if (scrollTop === undefined) continue
+            if (!scroller.clientHeight) {
+                visibleScrollersReady = false
+                continue
+            }
+            const maxScrollTop = scroller.scrollHeight - scroller.clientHeight
+            const position = Math.min(scrollTop, maxScrollTop)
+            scroller.scrollTop = position
+            if (scrollTop <= maxScrollTop && Math.abs(scroller.scrollTop - scrollTop) <= 1) {
+                if (maxScrollTop > 0) preservedLogScrollPositions.set(key, scroller.scrollTop)
+                if (!fullscreenTransition) pendingLogScrollPositions.delete(key)
+            } else {
+                visibleScrollersReady = false
+            }
+        }
+        if (clearPendingAfterRestore && visibleScrollersReady) {
+            pendingLogScrollPositions.clear()
+            clearPendingAfterRestore = false
+        }
+    }
+
+    function finishLogScrollRestore() {
+        fullscreenTransition = false
+        clearPendingAfterRestore = true
+        restoreLogScroll()
+    }
+
+    function toggleFullscreenModal() {
+        fullscreenModalOpen.value = !fullscreenModalOpen.value
+    }
+</script>
+
+<style scoped>
+    .attempt-wrapper {
+    background-color: var(--ks-bg-surface);
+
+    & :deep(.vue-recycle-scroller__item-view + .vue-recycle-scroller__item-view) {
+      border-top: 1px solid var(--ks-border-default);
+    }
+
+    .attempt-wrapper & {
+      border-radius: .25rem;
+    }
+  }
+
+  .log-lines {
+    .line {
+      padding: .5rem;
+    }
+
+    & .entry {
+      min-height: 2rem;
+    }
+  }
+
+  .log-lines.temporal {
+    margin-top: 0.5rem;
+    max-height: max(15rem, calc(100vh - 335px - var(--execution-banner-height, 0px)));
+    max-height: max(15rem, calc(100dvh - 335px - var(--execution-banner-height, 0px)));
+
+    &.fullscreen-logs {
+      max-height: none;
+    }
+
+    .line {
+      align-items: flex-start;
+    }
+  }
+
+  .logs-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--ks-spacing-2);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    padding: var(--ks-spacing-2) 0;
+    margin-bottom: var(--ks-spacing-2);
+    background: var(--ks-bg-base);
+  }
+
+  .logs-toolbar__left {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--ks-spacing-2);
+  }
+
+  .logs-toolbar__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--ks-spacing-2);
+    margin-left: auto;
+  }
+
+  .logs-toolbar {
+    --ks-button-adjacent-margin: 0;
+  }
+
+  .logs-toolbar__text-btn {
+    font-size: var(--ks-font-size-xs);
+  }
+
+  .fullscreen-logs-container {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .fullscreen-attempt-wrapper {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .fullscreen-logs {
+    flex: 1;
+    min-height: 0;
+  }
+</style>

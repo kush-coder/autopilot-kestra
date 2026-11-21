@@ -1,0 +1,111 @@
+import {getCurrentScope, onScopeDispose, watch, type Ref} from "vue"
+import * as monaco from "monaco-editor/editor/editor.api"
+import {pebbleTokens} from "@kestra-io/plumage"
+
+type CodeEditor = monaco.editor.IStandaloneCodeEditor
+
+export interface EditorDecorationsContext {
+    pebbleEnabled: Ref<boolean>
+    highlightLine: Ref<number | undefined>
+    initialHighlight: Ref<string | undefined>
+    codeEditor: () => CodeEditor | undefined
+    modifiedEditor: () => CodeEditor | undefined
+}
+
+export function useEditorDecorations(ctx: EditorDecorationsContext) {
+    let collection: monaco.editor.IEditorDecorationsCollection | undefined
+    const lists: {
+        pebble?: monaco.editor.IModelDeltaDecoration[]
+        lines?: monaco.editor.IModelDeltaDecoration[]
+    } = {}
+
+    let painted: {model: monaco.editor.ITextModel, version: number} | undefined
+
+    function attach(editor: monaco.editor.IStandaloneCodeEditor | monaco.editor.IStandaloneDiffEditor) {
+        collection = editor.createDecorationsCollection()
+        painted = undefined
+    }
+
+    function apply() {
+        collection?.clear()
+        if (lists.lines) collection?.append(lists.lines)
+        if (lists.pebble) collection?.append(lists.pebble)
+    }
+
+    // Called on every cursor move, so an unchanged model version keeps the decorations it already has.
+    function highlightPebble() {
+        if (!ctx.pebbleEnabled.value) {
+            lists.pebble = []
+            painted = undefined
+            apply()
+            return
+        }
+        const editor = ctx.codeEditor()
+        if (!editor) return
+        const model = editor.getModel?.()
+        const text = model?.getValue?.()
+        if (!text || !model) return
+        const version = model.getVersionId?.()
+        if (painted && painted.model === model && painted.version === version) return
+
+        lists.pebble = pebbleTokens(text).map(([start, end, role]) => ({
+            range: monaco.Range.fromPositions(model.getPositionAt(start), model.getPositionAt(end)),
+            options: {inlineClassName: `highlight-pebble-${role}`},
+        }))
+        painted = version === undefined ? undefined : {model, version}
+        apply()
+    }
+
+    function highlightLinesRange(range: {start: number, end: number}) {
+        lists.lines = [{
+            range: new monaco.Range(range.start, 1, range.end, 1),
+            options: {isWholeLine: true, className: "highlight-lines"},
+        }]
+        apply()
+    }
+
+    function clearLinesRangeHighlights() {
+        lists.lines = []
+        apply()
+    }
+
+    function selectLine(line: number) {
+        const editor = ctx.modifiedEditor()
+        if (!editor) return
+        editor.focus()
+        const end = editor.getModel()?.getLineMaxColumn(line) ?? 0
+        editor.setSelection(new monaco.Range(line, 0, line, end))
+    }
+
+    function highlightInitial() {
+        const needle = ctx.initialHighlight.value
+        if (!needle) return
+        const editor = ctx.modifiedEditor()
+        if (!editor) return
+
+        editor.focus()
+        const lines = editor.getModel()!.getLinesContent()
+        let lineNumber = 0
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(needle)) {
+                lineNumber = i + 1
+                break
+            }
+        }
+        const endLineCharacter = editor.getModel()!.getLineMaxColumn(lineNumber) ?? 0
+        editor.setSelection(new monaco.Range(lineNumber, 0, lineNumber, endLineCharacter))
+        editor.revealLineInCenter(lineNumber)
+    }
+
+    watch(ctx.highlightLine, (line) => {
+        if (line) selectLine(line)
+    })
+
+    if (getCurrentScope()) {
+        onScopeDispose(() => {
+            collection?.clear()
+        })
+    }
+
+    return {attach, highlightPebble, highlightLinesRange, clearLinesRangeHighlights, highlightInitial}
+}

@@ -1,0 +1,648 @@
+package io.kestra.plugin.core.flow;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+
+import com.google.common.collect.ImmutableMap;
+
+import io.kestra.core.exceptions.InternalException;
+import io.kestra.core.junit.annotations.FlakyTest;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.junit.annotations.LoadFlows;
+import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.annotations.PluginProperty;
+import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.models.executions.TaskRun;
+import io.kestra.core.models.executions.TaskRunAttempt;
+import io.kestra.core.models.flows.Flow;
+import io.kestra.core.models.flows.State;
+import io.kestra.core.models.property.Property;
+import io.kestra.core.models.tasks.Output;
+import io.kestra.core.models.tasks.RunnableTask;
+import io.kestra.core.models.tasks.Task;
+import io.kestra.core.models.tasks.common.EncryptedString;
+import io.kestra.core.queues.DispatchQueueInterface;
+import io.kestra.core.queues.QueueException;
+import io.kestra.core.repositories.ExecutionRepositoryInterface;
+import io.kestra.core.runners.FilesService;
+import io.kestra.core.runners.LocalWorkingDir;
+import io.kestra.core.runners.RunContext;
+import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.runners.TestRunnerUtils;
+import io.kestra.core.services.TaskOutputService;
+import io.kestra.core.storages.InternalStorage;
+import io.kestra.core.services.NamespaceService;
+import io.kestra.core.storages.NamespaceFactory;
+import io.kestra.core.storages.StorageContext;
+import io.kestra.core.storages.StorageInterface;
+import io.kestra.plugin.core.debug.Return;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import lombok.*;
+import lombok.experimental.SuperBuilder;
+
+import static io.kestra.core.tenant.TenantService.MAIN_TENANT;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@KestraTest(startRunner = true)
+@org.junit.jupiter.api.parallel.Execution(ExecutionMode.SAME_THREAD)
+public class WorkingDirectoryTest {
+    @Inject
+    Suite suite;
+
+    @Inject
+    RunContextFactory runContextFactory;
+
+    @Inject
+    TestRunnerUtils runnerUtils;
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory.yaml" })
+    void success() throws TimeoutException, QueueException, InternalException {
+        suite.success(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows(value = { "flows/valids/working-directory.yaml" }, tenantId = "tenant1")
+    void failed() throws TimeoutException, QueueException {
+        suite.failed("tenant1", runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-loop.yaml" })
+    void each() throws TimeoutException, QueueException, InternalException {
+        suite.loop(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-cache.yml" })
+    void cache() throws TimeoutException, IOException, QueueException, InternalException {
+        suite.cache(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-taskrun.yml" })
+    void taskrun() throws TimeoutException, InternalException, QueueException {
+        suite.taskRun(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-taskrun-nested.yml" })
+    void taskrunNested() throws TimeoutException, InternalException, QueueException {
+        suite.taskRunNested(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-namespace-files.yaml" })
+    void namespaceFiles() throws TimeoutException, IOException, QueueException, URISyntaxException, InternalException {
+        suite.namespaceFiles(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-namespace-files-with-namespaces.yaml" })
+    void namespaceFilesWithNamespace() throws TimeoutException, IOException, QueueException, URISyntaxException, InternalException {
+        suite.namespaceFilesWithNamespaces(runnerUtils);
+    }
+
+    @Test
+    void shouldOpenTheFolderBeforeAnyTaskAndCloseItAfterTheLastOne() throws Exception {
+        WorkingDirectory workingDirectory = fourSubtasksWorkingDirectory();
+        TaskRun parent = TaskRun.builder().id("worker-run").taskId("worker").state(new State().withState(State.Type.RUNNING)).build();
+        RunContext runContext = runContextFactory.of(workingDirectory, Map.of());
+
+        assertThat(workingDirectory.resolveNexts(runContext, runningExecution(parent), parent))
+            .extracting(next -> next.getTask().getId())
+            .containsExactly("worker_open");
+
+        Execution failedChild = runningExecution(
+            parent,
+            childTaskRun(parent, "worker_open", State.Type.SUCCESS),
+            childTaskRun(parent, "t1", State.Type.SUCCESS),
+            childTaskRun(parent, "t2", State.Type.SUCCESS),
+            childTaskRun(parent, "t3", State.Type.SUCCESS),
+            childTaskRun(parent, "t4", State.Type.FAILED)
+        );
+        assertThat(workingDirectory.resolveNexts(runContext, failedChild, parent))
+            .extracting(next -> next.getTask().getId())
+            .containsExactly("worker_close");
+        assertThat(workingDirectory.findById("worker_close")).containsInstanceOf(WorkingDirectory.Close.class);
+    }
+
+    @Test
+    void shouldGiveTheInternalTasksTheValueOfTheWorkingDirectoryInsideAForEach() throws Exception {
+        WorkingDirectory workingDirectory = fourSubtasksWorkingDirectory();
+        TaskRun parent = TaskRun.builder().id("worker-run").taskId("worker").value("item").state(new State().withState(State.Type.RUNNING)).build();
+        RunContext runContext = runContextFactory.of(workingDirectory, Map.of());
+
+        assertThat(workingDirectory.resolveNexts(runContext, runningExecution(parent), parent))
+            .extracting(next -> next.getTaskRun().getValue())
+            .containsExactly("item");
+    }
+
+    @Test
+    void shouldBindTheWorkingDirectoryToTheWorkerThatRanItsOpenTask() {
+        TaskRun parent = TaskRun.builder().id("worker-run").taskId("worker").state(new State().withState(State.Type.RUNNING)).build();
+        TaskRun open = childTaskRun(parent, "worker_open", State.Type.SUCCESS)
+            .withAttempts(List.of(TaskRunAttempt.builder().workerId("worker-1").state(new State().withState(State.Type.SUCCESS)).build()));
+
+        assertThat(WorkingDirectory.boundWorkerId(runningExecution(parent), parent.getId())).isEmpty();
+        assertThat(WorkingDirectory.boundWorkerId(runningExecution(parent, open), parent.getId())).contains("worker-1");
+    }
+
+    private static Execution runningExecution(TaskRun... taskRuns) {
+        return Execution.builder().state(new State().withState(State.Type.RUNNING)).taskRunList(List.of(taskRuns)).build();
+    }
+
+    private static TaskRun childTaskRun(TaskRun parent, String taskId, State.Type state) {
+        return TaskRun.builder()
+            .id(taskId + "-run")
+            .taskId(taskId)
+            .parentTaskRunId(parent.getId())
+            .state(new State().withState(state))
+            .build();
+    }
+
+    @Test
+    void shouldNotUploadTheCacheAgainWhenItsFilesDidNotChangeSinceTheOpenTask(@TempDir Path tempDir) throws Exception {
+        // Given a cache holding hello.txt, downloaded by the open task
+        LocalWorkingDir workingDir = new LocalWorkingDir(tempDir, "working-directory-test");
+        ByteArrayOutputStream archive = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(archive)) {
+            zip.putNextEntry(new ZipEntry("hello.txt"));
+            zip.write("cached".getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        RunContext runContext = mock(RunContext.class, RETURNS_DEEP_STUBS);
+        when(runContext.workingDir()).thenReturn(workingDir);
+        when(runContext.storage().getCacheFile(any(), any(), any())).thenReturn(Optional.of(new ByteArrayInputStream(archive.toByteArray())));
+        when(runContext.render(any(Property.class)).as(Duration.class)).thenReturn(Optional.of(Duration.ofHours(1)));
+        when(runContext.render(any(Property.class)).asList(String.class)).thenReturn(List.of("*.txt"));
+
+        // When the open and the close tasks run on distinct instances of the WorkingDirectory, as they are deserialized from distinct jobs
+        cachedWorkingDirectory().preExecuteTasks(runContext);
+        cachedWorkingDirectory().postExecuteTasks(runContext);
+
+        // Then the unchanged files are not uploaded again
+        verify(runContext.storage(), never()).putCacheFile(any(), any(), any());
+    }
+
+    @Test
+    void shouldNotFailTheCloseTaskWhenItsFolderCannotBeDeleted(@TempDir Path tempDir) throws Exception {
+        WorkingDirectory workingDirectory = spy(fourSubtasksWorkingDirectory());
+        doThrow(new IOException("folder locked")).when(workingDirectory).cleanup(any());
+
+        assertThatCode(() -> closeTask(workingDirectory).run(closeRunContext(tempDir))).doesNotThrowAnyException();
+    }
+
+    @Test
+    void shouldReportTheOutputFilesErrorWhenTheFolderCannotBeDeletedEither(@TempDir Path tempDir) throws Exception {
+        WorkingDirectory workingDirectory = spy(fourSubtasksWorkingDirectory());
+        doThrow(new IllegalStateException("output files not saved")).when(workingDirectory).postExecuteTasks(any());
+        doThrow(new IOException("folder locked")).when(workingDirectory).cleanup(any());
+
+        assertThatThrownBy(() -> closeTask(workingDirectory).run(closeRunContext(tempDir))).hasMessage("output files not saved");
+    }
+
+    private static WorkingDirectory.Close closeTask(WorkingDirectory workingDirectory) {
+        return WorkingDirectory.Close.builder()
+            .id("worker_close")
+            .type(WorkingDirectory.Close.class.getName())
+            .workingDirectory(workingDirectory)
+            .build();
+    }
+
+    private static RunContext closeRunContext(Path tempDir) {
+        LocalWorkingDir workingDir = new LocalWorkingDir(tempDir, "working-directory-test");
+        workingDir.path();
+        RunContext runContext = mock(RunContext.class, RETURNS_DEEP_STUBS);
+        when(runContext.workingDir()).thenReturn(workingDir);
+        return runContext;
+    }
+
+    private static WorkingDirectory cachedWorkingDirectory() {
+        return WorkingDirectory.builder()
+            .id("worker")
+            .type(WorkingDirectory.class.getName())
+            .cache(WorkingDirectory.Cache.builder().ttl(Property.ofValue(Duration.ofHours(1))).patterns(Property.ofValue(List.of("*.txt"))).build())
+            .tasks(List.of(Return.builder().id("t1").type(Return.class.getName()).format(Property.ofValue("first")).build()))
+            .build();
+    }
+
+    private static WorkingDirectory fourSubtasksWorkingDirectory() {
+        return WorkingDirectory.builder()
+            .id("worker")
+            .type(WorkingDirectory.class.getName())
+            .tasks(List.of(
+                Return.builder().id("t1").type(Return.class.getName()).format(Property.ofValue("first")).build(),
+                Return.builder().id("t2").type(Return.class.getName()).format(Property.ofValue("second")).build(),
+                Return.builder().id("t3").type(Return.class.getName()).format(Property.ofValue("third")).build(),
+                Return.builder().id("t4").type(Return.class.getName()).format(Property.ofValue("fourth")).build()
+            ))
+            .build();
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-inputs.yml" })
+    void inputFiles() throws Exception {
+        suite.inputFiles(runnerUtils);
+    }
+
+    // FIXME can be moved back to regular @Test once https://github.com/kestra-io/kestra/issues/13134 is handled
+    @FlakyTest(description = "Blocked by #13134: working directory output file handling")
+    @LoadFlows(value = { "flows/valids/working-directory-outputs.yml" }, tenantId = "output")
+    void outputFiles() throws Exception {
+        suite.outputFiles("output", runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-taskrun-encrypted.yml" })
+    void encryption() throws Exception {
+        suite.encryption(runnerUtils, runContextFactory);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-invalid-runif.yaml" })
+    void invalidRunIf() throws Exception {
+        suite.invalidRunIf(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-postexecute-failure.yaml" })
+    void shouldFailWorkingDirectoryWhenItsOutputFilesCannotBeSaved() throws Exception {
+        suite.outputFilesFailure(runnerUtils);
+    }
+
+    @Test
+    @LoadFlows({ "flows/valids/working-directory-secret-output.yml" })
+    void secretOutputMasking() throws Exception {
+        suite.secretOutputMasking(runnerUtils);
+    }
+
+    @Singleton
+    public static class Suite {
+        @Inject
+        StorageInterface storageInterface;
+        @Inject
+        NamespaceFactory namespaceFactory;
+        @Inject
+        NamespaceService namespaceService;
+        @Inject
+        TaskOutputService taskOutputService;
+        @Inject
+        ExecutionRepositoryInterface executionRepository;
+        @Inject
+        DispatchQueueInterface<LogEntry> logQueue;
+
+        public void success(TestRunnerUtils runnerUtils) throws TimeoutException, QueueException, io.kestra.core.exceptions.InternalException {
+            Execution execution = runnerUtils.runOne(
+                MAIN_TENANT, "io.kestra.tests", "working-directory", null,
+                (f, e) -> ImmutableMap.of("failed", "false"), Duration.ofSeconds(60)
+            );
+
+            assertThat(execution.getTaskRunList()).hasSize(6);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+            assertThat((String) taskOutputService.getOutputs(execution.findTaskRunsByTaskId("2_end").getFirst()).get("value")).startsWith("kestra://");
+        }
+
+        public void failed(String tenantId, TestRunnerUtils runnerUtils) throws TimeoutException, QueueException {
+            Execution execution = runnerUtils.runOne(
+                tenantId, "io.kestra.tests", "working-directory", null,
+                (f, e) -> ImmutableMap.of("failed", "true"), Duration.ofSeconds(60)
+            );
+
+            assertThat(execution.getTaskRunList()).hasSize(5);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.FAILED);
+            assertThat(execution.findTaskRunsByTaskId("error-t1")).hasSize(1);
+        }
+
+        public void loop(TestRunnerUtils runnerUtils) throws TimeoutException, QueueException, io.kestra.core.exceptions.InternalException {
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-loop", Duration.ofSeconds(60));
+
+            assertThat(execution.getTaskRunList()).hasSize(2);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+            List<Execution> subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+            assertThat(subExecutions).hasSize(1);
+
+            List<Execution> subSubExecutions = executionRepository.findLoopSubExecutions(subExecutions.getFirst().getTenantId(), subExecutions.getFirst().getId(), null);
+            assertThat(subExecutions).hasSize(1);
+
+            List<Execution> subSubSubExecutions = executionRepository.findLoopSubExecutions(subSubExecutions.getFirst().getTenantId(), subSubExecutions.getFirst().getId(), null);
+            assertThat(subSubSubExecutions).hasSize(1);
+
+            assertThat((String) taskOutputService.getOutputs(execution.findTaskRunsByTaskId("2_end").getFirst()).get("value")).startsWith("kestra://");
+        }
+
+        @SuppressWarnings("unchecked")
+        public void outputFiles(String tenantId, TestRunnerUtils runnerUtils) throws TimeoutException, IOException, QueueException, io.kestra.core.exceptions.InternalException {
+
+            Execution execution = runnerUtils.runOne(tenantId, "io.kestra.tests", "working-directory-outputs");
+
+            assertThat(execution.getTaskRunList()).hasSize(4);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+            TaskRun taskRun = execution.getTaskRunList().getFirst();
+            System.out.println(taskRun.getTaskId());
+            Map<String, Object> outputs = taskOutputService.getOutputs(taskRun);
+            assertThat(outputs).containsKey("outputFiles");
+
+            StorageContext storageContext = StorageContext.forTask(taskRun);
+            InternalStorage storage = new InternalStorage(
+                null,
+                storageContext,
+                storageInterface,
+                namespaceService,
+                namespaceFactory
+            );
+
+            URI uri = ((Map<String, String>) outputs.get("outputFiles")).values()
+                .stream()
+                .map(URI::create)
+                .toList().getFirst();
+            assertThat(new String(storage.getFile(uri).readAllBytes())).isEqualTo("Hello World");
+        }
+
+        @SuppressWarnings("unchecked")
+        public void inputFiles(TestRunnerUtils runnerUtils) throws TimeoutException, IOException, QueueException, io.kestra.core.exceptions.InternalException {
+
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-inputs");
+
+            assertThat(execution.getTaskRunList()).hasSize(4);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+            StorageContext storageContext = StorageContext.forTask(execution.findTaskRunsByTaskId("inputFiles").getFirst());
+            InternalStorage storage = new InternalStorage(
+                null,
+                storageContext,
+                storageInterface,
+                namespaceService,
+                namespaceFactory
+            );
+
+            TaskRun taskRun = execution.findTaskRunsByTaskId("inputFiles").getFirst();
+            Map<String, Object> outputs = taskOutputService.getOutputs(taskRun);
+            assertThat(outputs).containsKey("uris");
+
+            URI uri = URI.create(((Map<String, String>) outputs.get("uris")).get("input.txt"));
+
+            assertTrue(uri.toString().endsWith("input.txt"));
+            assertThat(new String(storage.getFile(uri).readAllBytes())).isEqualTo("Hello World");
+        }
+
+        @SuppressWarnings({ "unchecked", "OptionalGetWithoutIsPresent" })
+        public void cache(TestRunnerUtils runnerUtils) throws TimeoutException, IOException, QueueException, io.kestra.core.exceptions.InternalException {
+            // make sure the cache didn't exist
+            StorageContext storageContext = StorageContext.forFlow(
+                Flow
+                    .builder()
+                    .namespace("io.kestra.tests")
+                    .id("working-directory-cache")
+                    .tenantId(MAIN_TENANT)
+                    .build()
+            );
+            InternalStorage storage = new InternalStorage(
+                null,
+                storageContext,
+                storageInterface,
+                namespaceService,
+                namespaceFactory
+            );
+            storage.deleteCacheFile("workingDir", null);
+
+            URI cacheURI = storageContext.getCacheURI("workingdir", null);
+            assertFalse(storageInterface.exists(MAIN_TENANT, null, cacheURI));
+
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-cache");
+
+            assertThat(execution.getTaskRunList()).hasSize(5);
+            assertThat(
+                taskOutputService.getOutputs(
+                    execution.getTaskRunList().stream()
+                        .filter(t -> t.getTaskId().equals("exists"))
+                        .findFirst().get()
+                )
+            ).containsAllEntriesOf(Map.of("uris", Collections.emptyMap()));
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+            await().atMost(Duration.ofSeconds(10)).until(() -> storageInterface.exists(MAIN_TENANT, null, cacheURI));
+
+            // a second run should use the cache so the task `exists` should output the cached file
+            execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-cache");
+
+            assertThat(execution.getTaskRunList()).hasSize(5);
+            assertThat(
+                ((Map<String, String>) taskOutputService.getOutputs(
+                    execution.getTaskRunList().stream()
+                        .filter(t -> t.getTaskId().equals("exists"))
+                        .findFirst().get()
+                )
+                    .get("uris"))
+                    .containsKey("hello.txt")
+            ).isTrue();
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        }
+
+        public void taskRun(TestRunnerUtils runnerUtils) throws TimeoutException, InternalException, QueueException {
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-taskrun");
+
+            assertThat(execution.getTaskRunList()).hasSize(1);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+            var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+            assertThat(subExecutions.size()).isEqualTo(1);
+            assertThat(((String) taskOutputService.getOutputs(subExecutions.getFirst().findTaskRunsByTaskId("log-taskrun").getFirst()).get("value"))).contains("1");
+        }
+
+        public void taskRunNested(TestRunnerUtils runnerUtils) throws TimeoutException, InternalException, QueueException {
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-taskrun-nested");
+
+            assertThat(execution.getTaskRunList()).hasSize(1);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+            var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+            assertThat(subExecutions.size()).isEqualTo(1);
+            assertThat(((String) taskOutputService.getOutputs(subExecutions.getFirst().findTaskRunsByTaskId("log-workerparent").getFirst()).get("value")))
+                .contains("{\"task\":{\"id\":\"seq\"}}");
+        }
+
+        public void namespaceFiles(TestRunnerUtils runnerUtils) throws TimeoutException, IOException, QueueException, URISyntaxException, io.kestra.core.exceptions.InternalException {
+            put("/test/a/b/c/1.txt", "first");
+            put("/a/b/c/2.txt", "second");
+            put("/a/b/3.txt", "third");
+            put("/ignore/4.txt", "4th");
+
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-namespace-files");
+
+            assertThat(execution.getTaskRunList()).hasSize(8);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.WARNING);
+            assertThat(execution.findTaskRunsByTaskId("t4").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t1").getFirst()).get("value")).isEqualTo("first");
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t2").getFirst()).get("value")).isEqualTo("second");
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t3").getFirst()).get("value")).isEqualTo("third");
+        }
+
+        public void namespaceFilesWithNamespaces(TestRunnerUtils runnerUtils)
+            throws TimeoutException, IOException, QueueException, URISyntaxException, io.kestra.core.exceptions.InternalException {
+            //fist namespace
+            put("/test/a/b/c/1.txt", "first in first namespace", "io.test.first");
+            put("/a/b/c/2.txt", "second in first namespace", "io.test.first");
+            put("/a/b/3.txt", "third in first namespace", "io.test.first");
+            put("/ignore/4.txt", "4th");
+
+            //second namespace
+            put("/test/a/b/c/1.txt", "first in second namespace", "io.test.second");
+            put("/a/b/c/2.txt", "second in second namespace", "io.test.second");
+
+            //third namespace
+            put("/test/a/b/c/1.txt", "first in third namespace", "io.test.third");
+
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-namespace-files-with-namespaces");
+
+            assertThat(execution.getTaskRunList()).hasSize(8);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.WARNING);
+            assertThat(execution.findTaskRunsByTaskId("t4").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t1").getFirst()).get("value")).isEqualTo("first in third namespace");
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t2").getFirst()).get("value")).isEqualTo("second in second namespace");
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("t3").getFirst()).get("value")).isEqualTo("third in first namespace");
+        }
+
+        @SuppressWarnings("unchecked")
+        public void encryption(TestRunnerUtils runnerUtils, RunContextFactory runContextFactory)
+            throws TimeoutException, GeneralSecurityException, QueueException, io.kestra.core.exceptions.InternalException {
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-taskrun-encrypted");
+
+            assertThat(execution.getTaskRunList()).hasSize(5);
+            Map<String, Object> encryptedString = (Map<String, Object>) taskOutputService.getOutputs(execution.findTaskRunsByTaskId("encrypted").getFirst()).get("value");
+            assertThat(encryptedString.get("type")).isEqualTo(EncryptedString.TYPE);
+            String encryptedValue = (String) encryptedString.get("value");
+            assertThat(encryptedValue).isNotEqualTo("Hello World");
+            assertThat(runContextFactory.of().decrypt(encryptedValue)).isEqualTo("Hello World");
+            assertThat(taskOutputService.getOutputs(execution.findTaskRunsByTaskId("decrypted").getFirst()).get("value")).isEqualTo("Hello World");
+        }
+
+        public void secretOutputMasking(TestRunnerUtils runnerUtils) throws TimeoutException, QueueException, InterruptedException, io.kestra.core.exceptions.InternalException {
+            // Given — a listener on the log queue for the WorkingDirectory's `log` subtask
+            AtomicReference<LogEntry> logEntry = new AtomicReference<>();
+            CountDownLatch countDownLatch = new CountDownLatch(1);
+            logQueue.addListener(left ->
+            {
+                if (left.getFlowId().equals("working-directory-secret-output") && left.getTaskId().equals("log")) {
+                    logEntry.set(left);
+                    countDownLatch.countDown();
+                }
+            });
+
+            // When — a WorkingDirectory subtask (`encrypted`) produces a SECRET-typed output and the
+            // next subtask (`log`) logs it, reproducing the original repro across the subtask boundary
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-secret-output");
+
+            // Then — the `log` subtask masks the decrypted secret instead of printing it in plaintext
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+            assertTrue(countDownLatch.await(10, TimeUnit.SECONDS));
+            assertThat(logEntry.get()).isNotNull();
+            assertThat(logEntry.get().getMessage()).isEqualTo("secret is ******");
+        }
+
+        public void invalidRunIf(TestRunnerUtils runnerUtils) throws TimeoutException, QueueException {
+            Execution execution = runnerUtils.runOne(
+                MAIN_TENANT, "io.kestra.tests", "working-directory-invalid-runif", null,
+                (f, e) -> ImmutableMap.of("failed", "false"), Duration.ofSeconds(60)
+            );
+
+            assertThat(execution.getTaskRunList()).hasSize(5);
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.FAILED);
+        }
+
+        public void outputFilesFailure(TestRunnerUtils runnerUtils) throws TimeoutException, QueueException {
+            Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "working-directory-postexecute-failure");
+
+            assertThat(execution.findTaskRunsByTaskId("workingDirectory_close").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+            assertThat(execution.findTaskRunsByTaskId("workingDirectory").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+            assertThat(execution.findTaskRunsByTaskId("after")).isEmpty();
+            assertThat(execution.findTaskRunsByTaskId("onError")).isNotEmpty();
+            assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.FAILED);
+        }
+
+        private void put(String path, String content) throws IOException, URISyntaxException {
+            put(path, content, "io.kestra.tests");
+        }
+
+        private void put(String path, String content, String namespace) throws IOException, URISyntaxException {
+            namespaceFactory.of(MAIN_TENANT, namespace).putFile(Path.of(path), new ByteArrayInputStream(content.getBytes()));
+        }
+    }
+
+    @SuperBuilder
+    @ToString
+    @EqualsAndHashCode
+    @Getter
+    @NoArgsConstructor
+    @Plugin
+    public static class LocalFiles extends Task implements RunnableTask<LocalFiles.LocalFilesOutput> {
+        @Schema(
+            title = "The files to be created on the local filesystem; it can be a map or a JSON object.",
+            oneOf = { Map.class, String.class }
+        )
+        @PluginProperty(dynamic = true)
+        private Object inputs;
+
+        @Schema(
+            title = "The files from the local filesystem to be sent to the Kestra's internal storage",
+            description = "Must be a list of [glob](https://en.wikipedia.org/wiki/Glob_(programming)) expressions relative to the current working directory, some examples: `my-dir/**`, `my-dir/*/**` or `my-dir/my-file.txt`."
+        )
+        private Property<List<String>> outputs;
+
+        @Override
+        public LocalFiles.LocalFilesOutput run(RunContext runContext) throws Exception {
+            FilesService.inputFiles(runContext, this.inputs);
+            Map<String, URI> outputFiles = FilesService.outputFiles(runContext, runContext.render(this.outputs).asList(String.class));
+
+            return LocalFiles.LocalFilesOutput.builder()
+                .uris(outputFiles)
+                .build();
+        }
+
+        @Builder
+        @Getter
+        public static class LocalFilesOutput implements Output {
+            @Schema(title = "The URI of the files that have been sent to the Kestra's internal storage")
+            private Map<String, URI> uris;
+        }
+    }
+}

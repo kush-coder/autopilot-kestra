@@ -1,0 +1,220 @@
+<template>
+    <ElDrawer
+        v-model="model"
+        destroyOnClose
+        lockScroll
+        :resizable="resizable"
+        :size="resizable ? drawerSize : (props.size ?? '')"
+        :appendToBody="true"
+        :beforeClose="guardedBeforeClose"
+        v-bind="{...filteredProps(), ...$attrs}"
+        :class="{'full-screen': fullScreen && !resizable}"
+        @resize-end="onResizeEnd"
+        @before-close="emit('before-close', $event)"
+    >
+        <slot />
+        <template v-if="$slots.header || props.title" #header>
+            <span>
+                {{ props.title }}
+                <slot name="header" />
+            </span>
+            <KsButton link @click="toggleFullScreen">
+                <ArrowCollapse v-if="fullScreen" class="full-screen" />
+                <ArrowExpand v-else class="full-screen" />
+            </KsButton>
+        </template>
+        <template v-if="$slots.footer" #footer>
+            <slot name="footer" />
+        </template>
+    </ElDrawer>
+</template>
+
+<script setup lang="ts">
+    import {ref, computed, type HTMLAttributes} from "vue"
+    import {ElDrawer, type DrawerProps} from "element-plus"
+    import ArrowExpand from "vue-material-design-icons/ArrowExpand.vue"
+    import ArrowCollapse from "vue-material-design-icons/ArrowCollapse.vue"
+    import {usePassedProps} from "../../utils/filteredProps"
+    import type {NativeAttributes} from "../../utils/nativeAttributes"
+    import {useDiscardGuard} from "../../composables/useDiscardGuard"
+
+    defineOptions({inheritAttrs: false})
+
+    const model = defineModel<boolean>({default: false})
+
+    export interface KsDrawerProps extends Omit<DrawerProps, "modelValue"> {
+        isFullScreen?: boolean
+        dirty?: boolean
+        dirtyMessage?: string
+    }
+
+    const props = withDefaults(defineProps<KsDrawerProps & /* @vue-ignore */ Omit<NativeAttributes<HTMLAttributes>, keyof KsDrawerProps>>(), {
+        isFullScreen: false,
+        resizable: false,
+        dirty: false,
+    })
+
+    const emit = defineEmits<{
+        "before-close": [done: () => void]
+    }>()
+
+    defineSlots<{
+        default?(): unknown
+        header?(): unknown
+        footer?(): unknown
+    }>()
+
+    const FULLSCREEN_THRESHOLD = 0.95
+
+    const fullScreenToggle = ref(props.isFullScreen)
+    const drawerWidth = ref<number | null>(null)
+    const widthBeforeFullScreen = ref<number | null>(null)
+
+    const isFullScreenWidth = (width: number | null) => width != null && width >= window.innerWidth * FULLSCREEN_THRESHOLD
+
+    const resizableFull = computed(() => props.resizable && isFullScreenWidth(drawerWidth.value))
+    const fullScreen = computed(() => (props.resizable ? resizableFull.value : fullScreenToggle.value))
+
+    const drawerSize = computed(() => (drawerWidth.value != null ? `${drawerWidth.value}px` : (props.size ?? "65%")))
+
+    const onResizeEnd = (_event: MouseEvent, size: number) => {
+        const width = Math.round(size)
+        if (!resizableFull.value && isFullScreenWidth(width)) {
+            widthBeforeFullScreen.value = drawerWidth.value
+        }
+        drawerWidth.value = width
+    }
+
+    const toggleFullScreen = () => {
+        if (props.resizable) {
+            if (resizableFull.value) {
+                drawerWidth.value = widthBeforeFullScreen.value
+            } else {
+                widthBeforeFullScreen.value = drawerWidth.value
+                drawerWidth.value = window.innerWidth
+            }
+        } else {
+            fullScreenToggle.value = !fullScreenToggle.value
+        }
+    }
+
+    const filteredProps = usePassedProps(props, ["beforeClose", "dirty", "dirtyMessage", "isFullScreen", "size"])
+
+    const {guardedClose} = useDiscardGuard(() => props.dirty, {get message() { return props.dirtyMessage }})
+    const guardedBeforeClose = (done: () => void) => guardedClose(() => (props.beforeClose ? props.beforeClose(done) : done()))
+</script>
+
+<style lang="scss">
+    @use '../../assets/styles/el-ns';
+    @use 'element-plus/theme-chalk/src/drawer';
+</style>
+
+<style>
+    .kel-drawer {
+        --kel-drawer-bg-color: var(--ks-bg-sidebar);
+
+        &.ltr {
+            border-right: 1px solid var(--ks-border-default);
+        }
+
+        &.rtl {
+            border-left: 1px solid var(--ks-border-default);
+        }
+
+        &.ttb {
+            border-bottom: 1px solid var(--ks-border-default);
+        }
+
+        &.btt {
+            border-top: 1px solid var(--ks-border-default);
+        }
+
+        &.ltr,
+        &.rtl {
+            width: 70%;
+
+            @media only screen and (max-width: 767px) {
+                width: 95%;
+                min-width: 0;
+                max-width: 92vw;
+            }
+
+            @media only screen and (min-width: 992px) {
+                width: 70%;
+            }
+
+            @media only screen and (min-width: 1200px) {
+                width: 35%;
+                min-width: 800px;
+            }
+
+            &.sm {
+                min-width: auto;
+
+                @media only screen and (max-width: 767px) {
+                    width: 95%;
+                }
+
+                @media only screen and (min-width: 768px) {
+                    width: 50%;
+                }
+
+                @media only screen and (min-width: 1200px) {
+                    width: 30%;
+                }
+            }
+        }
+
+        &.ttb,
+        &.btt {
+            height: 70%;
+
+            @media only screen and (max-width: 767px) {
+                height: 95%;
+            }
+
+            @media only screen and (min-width: 1200px) {
+                height: 50%;
+            }
+
+            @media only screen and (min-width: 1200px) {
+                height: 35%;
+                min-height: 600px;
+            }
+
+            &.sm {
+                height: 30%;
+                min-width: auto;
+            }
+        }
+
+        &.full-screen {
+            width: 99% !important;
+            max-width: none;
+        }
+
+        & .kel-drawer__header {
+            padding: 1rem;
+            margin-bottom: 0;
+            background-color: var(--ks-bg-base);
+            border-bottom: 1px solid var(--ks-border-default);
+            color: var(--ks-text-primary);
+            font-weight: bold;
+
+            & h3 {
+                font-size: var(--kel-font-size-large);
+                margin-bottom: 0;
+            }
+
+            & .full-screen {
+                margin-right: 1rem;
+
+                & > .material-design-icon__svg {
+                    width: 1.375rem;
+                    height: 1.375rem;
+                    bottom: -0.250rem;
+                }
+            }
+        }
+    }
+</style>

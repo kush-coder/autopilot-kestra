@@ -1,0 +1,54 @@
+<template>
+    <ElCard v-bind="({...filteredProps(), ...$attrs} as CardProps)">
+        <template v-if="$slots.default" #default>
+            <slot />
+        </template>
+        <template v-if="$slots.header" #header>
+            <slot name="header" />
+        </template>
+        <template v-if="$slots.footer" #footer>
+            <slot name="footer" />
+        </template>
+    </ElCard>
+</template>
+
+<script setup lang="ts">
+    import type {NativeAttributes} from "../../utils/nativeAttributes"
+    import type {HTMLAttributes} from "vue"
+    import {ElCard, type CardProps} from "element-plus"
+
+    import {usePassedProps} from "../../utils/filteredProps"
+
+    defineOptions({inheritAttrs: false})
+
+    const props = defineProps<CardProps & /* @vue-ignore */ Omit<NativeAttributes<HTMLAttributes>, keyof CardProps>>()
+
+    const filteredProps = usePassedProps(props)
+
+    defineSlots<{
+        default?(): unknown
+        header?(): unknown
+        footer?(): unknown
+    }>()
+</script>
+
+<style lang="scss">
+    @use '../../assets/styles/el-ns';
+    @use 'element-plus/theme-chalk/src/card';
+</style>
+
+<style>
+    .kel-card {
+        border-radius: var(--kel-border-radius-round);
+        --kel-card-border-color: var(--ks-border-default);
+        --kel-card-border-radius: var(--kel-border-radius-round);
+        --kel-card-padding: 1rem;
+        color: var(--ks-text-primary);
+        background-color: var(--ks-bg-surface);
+
+        & .kel-card__header {
+            padding: var(--ks-card-header-padding, var(--ks-spacing-2) var(--ks-spacing-4));
+            font-weight: bold;
+        }
+    }
+</style>

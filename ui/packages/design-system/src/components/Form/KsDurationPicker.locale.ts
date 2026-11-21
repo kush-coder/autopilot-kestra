@@ -1,0 +1,145 @@
+export default {
+    "en": {
+        "days": "Days",
+        "hours": "Hours",
+        "minutes": "Minutes",
+        "seconds": "Seconds",
+        "input_custom_duration": "or input custom duration:",
+        "invalid_duration": "Invalid ISO 8601 duration: {value}",
+        "datepicker": {
+            "custom duration": "Custom duration",
+        },
+    },
+    "de": {
+        "days": "Tage",
+        "hours": "Stunden",
+        "minutes": "Minuten",
+        "seconds": "Sekunden",
+        "input_custom_duration": "oder benutzerdefinierte Dauer eingeben:",
+        "invalid_duration": "Ungültige ISO-8601-Dauer: {value}",
+        "datepicker": {
+            "custom duration": "Benutzerdefinierte Dauer",
+        },
+    },
+    "es": {
+        "days": "Días",
+        "hours": "Horas",
+        "minutes": "Minutos",
+        "seconds": "Segundos",
+        "input_custom_duration": "o ingrese duración personalizada:",
+        "invalid_duration": "Duración ISO 8601 no válida: {value}",
+        "datepicker": {
+            "custom duration": "Duración personalizada",
+        },
+    },
+    "fr": {
+        "days": "Jours",
+        "hours": "Heures",
+        "minutes": "Minutes",
+        "seconds": "Secondes",
+        "input_custom_duration": "ou saisir une durée personnalisée :",
+        "invalid_duration": "Durée ISO 8601 invalide : {value}",
+        "datepicker": {
+            "custom duration": "Durée personnalisée",
+        },
+    },
+    "hi": {
+        "days": "दिन",
+        "hours": "घंटे",
+        "minutes": "मिनट्स",
+        "seconds": "सेकंड्स",
+        "input_custom_duration": "या कस्टम अवधि दर्ज करें:",
+        "invalid_duration": "अमान्य ISO 8601 अवधि: {value}",
+        "datepicker": {
+            "custom duration": "कस्टम अवधि",
+        },
+    },
+    "it": {
+        "days": "Giorni",
+        "hours": "Ore",
+        "minutes": "Minuti",
+        "seconds": "Secondi",
+        "input_custom_duration": "oppure inserisci durata personalizzata:",
+        "invalid_duration": "Durata ISO 8601 non valida: {value}",
+        "datepicker": {
+            "custom duration": "Durata personalizzata",
+        },
+    },
+    "ja": {
+        "days": "日数",
+        "hours": "営業時間",
+        "minutes": "分",
+        "seconds": "秒",
+        "input_custom_duration": "またはカスタム期間を入力してください:",
+        "invalid_duration": "無効な ISO 8601 期間: {value}",
+        "datepicker": {
+            "custom duration": "カスタム期間",
+        },
+    },
+    "ko": {
+        "days": "일",
+        "hours": "운영 시간",
+        "minutes": "분",
+        "seconds": "초",
+        "input_custom_duration": "또는 사용자 지정 기간 입력:",
+        "invalid_duration": "잘못된 ISO 8601 기간: {value}",
+        "datepicker": {
+            "custom duration": "사용자 정의 지속 시간",
+        },
+    },
+    "pl": {
+        "days": "Dni",
+        "hours": "Godziny",
+        "minutes": "Minuty",
+        "seconds": "Sekundy",
+        "input_custom_duration": "lub wprowadź niestandardowy czas trwania:",
+        "invalid_duration": "Nieprawidłowy czas trwania ISO 8601: {value}",
+        "datepicker": {
+            "custom duration": "Niestandardowy czas trwania",
+        },
+    },
+    "pt": {
+        "days": "Dias",
+        "hours": "Horas",
+        "minutes": "Minutos",
+        "seconds": "Segundos",
+        "input_custom_duration": "ou insira uma duração personalizada:",
+        "invalid_duration": "Duração ISO 8601 inválida: {value}",
+        "datepicker": {
+            "custom duration": "Duração personalizada",
+        },
+    },
+    "pt_BR": {
+        "days": "Dias",
+        "hours": "Horas",
+        "minutes": "Minutos",
+        "seconds": "Segundos",
+        "input_custom_duration": "ou insira uma duração personalizada:",
+        "invalid_duration": "Duração ISO 8601 inválida: {value}",
+        "datepicker": {
+            "custom duration": "Duração personalizada",
+        },
+    },
+    "ru": {
+        "days": "Дни",
+        "hours": "Часы",
+        "minutes": "Минуты",
+        "seconds": "Секунды",
+        "input_custom_duration": "или введите пользовательскую продолжительность:",
+        "invalid_duration": "Недопустимая длительность ISO 8601: {value}",
+        "datepicker": {
+            "custom duration": "Пользовательская длительность",
+        },
+    },
+    "zh_CN": {
+        "days": "天数",
+        "hours": "小时",
+        "minutes": "分钟",
+        "seconds": "秒钟",
+        "input_custom_duration": "或输入自定义持续时间：",
+        "invalid_duration": "无效的 ISO 8601 时长：{value}",
+        "datepicker": {
+            "custom duration": "自定义持续时间",
+        },
+    },
+}

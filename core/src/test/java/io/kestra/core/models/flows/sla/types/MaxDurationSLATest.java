@@ -1,0 +1,48 @@
+package io.kestra.core.models.flows.sla.types;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.Optional;
+
+import org.junit.jupiter.api.Test;
+
+import io.kestra.core.exceptions.InternalException;
+import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.flows.State;
+import io.kestra.core.models.flows.sla.SLA;
+import io.kestra.core.models.flows.sla.Violation;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.*;
+
+class MaxDurationSLATest {
+
+    @Test
+    void shouldEvaluateToAViolation() throws InternalException, InterruptedException {
+        MaxDurationSLA maxDurationSLA = MaxDurationSLA.builder()
+            .duration(Duration.ofMillis(50))
+            .build();
+        Execution execution = Execution.builder()
+            .state(new State().withState(State.Type.RUNNING))
+            .build();
+        Thread.sleep(100);
+
+        Optional<Violation> evaluate = maxDurationSLA.evaluate(null, execution, Map.of(SLA.SLA_DURATION_ATTRIBUTE, maxDurationSLA.getDuration()));
+        assertTrue(evaluate.isPresent());
+        assertThat(evaluate.get().reason()).contains("execution duration of");
+        assertThat(evaluate.get().reason()).contains("exceeds the deadline of PT0.05S.");
+    }
+
+    @Test
+    void shouldEvaluateToNoViolation() throws InternalException {
+        MaxDurationSLA maxDurationSLA = MaxDurationSLA.builder()
+            .duration(Duration.ofSeconds(10))
+            .build();
+        Execution execution = Execution.builder()
+            .state(new State().withState(State.Type.RUNNING))
+            .build();
+
+        Optional<Violation> evaluate = maxDurationSLA.evaluate(null, execution, Map.of(SLA.SLA_DURATION_ATTRIBUTE, maxDurationSLA.getDuration()));
+        assertTrue(evaluate.isEmpty());
+    }
+}

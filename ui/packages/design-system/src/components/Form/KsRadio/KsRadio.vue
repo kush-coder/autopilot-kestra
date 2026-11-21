@@ -1,0 +1,57 @@
+<template>
+    <ElRadio
+        v-model="model"
+        v-bind="({...filteredProps(), ...$attrs} as RadioProps)"
+        @change="emit('change', $event)"
+    >
+        <template v-if="$slots.default" #default>
+            <slot />
+        </template>
+    </ElRadio>
+</template>
+
+<script setup lang="ts">
+    import {ElRadio, type RadioProps} from "element-plus"
+    import {useFilteredProps} from "../../../utils/filteredProps"
+
+    defineOptions({inheritAttrs: false})
+
+    const model = defineModel<string | number | boolean>()
+
+    const props = defineProps<{
+        value?: string | number | boolean
+        label?: string | number | boolean
+        disabled?: boolean
+    }>()
+
+    const emit = defineEmits<{
+        change: [value: string | number | boolean | undefined]
+    }>()
+
+    defineSlots<{
+        default?(): unknown
+    }>()
+
+    const filteredProps = useFilteredProps(props)
+</script>
+
+<style lang="scss">
+    @use '../../../assets/styles/el-ns';
+    @use 'element-plus/theme-chalk/src/radio';
+</style>
+
+<style>
+    .kel-radio {
+        --kel-radio-input-width: var(--ks-radio-size, 14px);
+        --kel-radio-input-height: var(--ks-radio-size, 14px);
+
+        & .kel-radio__inner::after {
+            width: var(--ks-radio-dot-size, 6px);
+            height: var(--ks-radio-dot-size, 6px);
+        }
+
+        & .kel-radio__input.is-checked + .kel-radio__label {
+            color: var(--kel-radio-text-color);
+        }
+    }
+</style>

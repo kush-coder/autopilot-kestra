@@ -1,0 +1,479 @@
+package io.kestra.worker.processors;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+
+import org.slf4j.Logger;
+import org.slf4j.event.Level;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.google.common.collect.ImmutableList;
+
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
+import io.kestra.core.metrics.MetricRegistry;
+import io.kestra.core.models.executions.*;
+import io.kestra.core.models.flows.State;
+import io.kestra.core.models.tasks.AssetFailureBehavior;
+import io.kestra.core.models.tasks.RunnableTask;
+import io.kestra.core.models.tasks.Task;
+import io.kestra.core.runners.*;
+import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.server.ServerConfig;
+import io.kestra.core.server.WorkerTaskRestartStrategy;
+import io.kestra.core.trace.Tracer;
+import io.kestra.core.utils.Hashing;
+import io.kestra.core.utils.Logs;
+import io.kestra.worker.WorkerSecurityService;
+import io.kestra.worker.processors.internals.WorkerTaskCallable;
+import io.kestra.worker.queues.WorkerQueue;
+import io.kestra.worker.services.ExecutionKilledManager;
+
+import lombok.extern.slf4j.Slf4j;
+
+import static io.kestra.core.models.flows.State.Type.*;
+
+@Slf4j
+public class WorkerTaskProcessor extends AbstractWorkerJobProcessor<WorkerTask> {
+    // METRICS
+    private static final Map<Long, AtomicInteger> METRIC_RUNNING_COUNT = new ConcurrentHashMap<>();
+
+    private final String workerId;
+    private final String workerGroup;
+
+    // SERVICES
+    private final ServerConfig serverConfig;
+    private final RunContextInitializer runContextInitializer;
+    private final RunContextLoggerFactory runContextLoggerFactory;
+    private final WorkingDirFactory workingDirFactory;
+
+    // QUEUEs
+    private final WorkerQueue<WorkerTaskResult> workerTaskResultQueue;
+    private final WorkerQueue<MetricEntry> workerMetricQueue;
+
+    public WorkerTaskProcessor(final String workerId,
+        final String workerGroup,
+        final ServerConfig serverConfig,
+        final MetricRegistry metricRegistry,
+        final WorkerSecurityService workerSecurityService,
+        final Tracer tracer,
+        final RunContextInitializer runContextInitializer,
+        final RunContextLoggerFactory runContextLoggerFactory,
+        final WorkerQueue<WorkerTaskResult> workerTaskResultQueue,
+        final WorkerQueue<MetricEntry> workerMetricQueue,
+        final ExecutionKilledManager executionKilledManager,
+        final WorkingDirFactory workingDirFactory) {
+        super(workerGroup, metricRegistry, workerSecurityService, tracer, executionKilledManager);
+        this.workingDirFactory = workingDirFactory;
+        this.runContextInitializer = runContextInitializer;
+        this.runContextLoggerFactory = runContextLoggerFactory;
+        this.workerId = workerId;
+        this.workerGroup = workerGroup;
+        this.serverConfig = serverConfig;
+        this.workerTaskResultQueue = workerTaskResultQueue;
+        this.workerMetricQueue = workerMetricQueue;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected void doProcess(final WorkerTask workerTask) {
+        Task task = workerTask.getTask();
+        if (task instanceof RunnableTask) {
+            if (workerTask.getWorkingDirectoryId() == null) {
+                runTask(workerTask, true);
+            } else {
+                WorkingDir workingDir = workingDirFactory.createWorkingDirectory(workerTask.getTaskRun().getExecutionId(), workerTask.getWorkingDirectoryId());
+                runTask(workerTask, false, runContextInitializer.forWorkingDirectorySubtask(workerTask, workingDir));
+            }
+        } else {
+            throw new IllegalArgumentException("Unable to process the task '" + task.getId() + "' as it's not a runnable task");
+        }
+    }
+
+    private WorkerTaskResult runTask(WorkerTask workerTask, boolean cleanUp) {
+        return runTask(workerTask, cleanUp, null);
+    }
+
+    private WorkerTaskResult runTask(WorkerTask workerTask, boolean cleanUp, DefaultRunContext providedRunContext) {
+        String[] metricTags = metricRegistry.tags(workerTask, workerGroup);
+
+        this.metricRegistry
+            .counter(MetricRegistry.METRIC_WORKER_STARTED_COUNT, MetricRegistry.METRIC_WORKER_STARTED_COUNT_DESCRIPTION, metricTags)
+            .increment();
+
+        if (workerTask.getTaskRun().getState().getCurrent() == CREATED || workerTask.getTaskRun().getState().getCurrent() == SUBMITTED) {
+            this.metricRegistry
+                .timer(MetricRegistry.METRIC_WORKER_QUEUED_DURATION, MetricRegistry.METRIC_WORKER_QUEUED_DURATION_DESCRIPTION, metricTags)
+                .record(
+                    Duration.between(
+                        workerTask.getTaskRun().getState().getStartDate(), Instant.now()
+                    )
+                );
+        }
+
+        RunContext runContext = null;
+        try {
+            // Check if the execution has been killed before starting the task
+            if (
+                !Boolean.TRUE.equals(workerTask.getTaskRun().getForceExecution())
+                    && executionKilledManager.isExecutionKilled(workerTask.getTaskRun().getExecutionId())
+            ) {
+                WorkerTaskResult workerTaskResult = new WorkerTaskResult(workerTask.getTaskRun().withState(State.Type.KILLED));
+                workerTaskResultQueue.put(workerTaskResult);
+                // We cannot remove the execution ID from the killed cache in case the worker is processing
+                // multiple tasks of the execution which can happen due to parallel processing.
+                return workerTaskResult;
+            }
+
+            Logs.logTaskRun(
+                workerTask.getTaskRun(),
+                Level.INFO,
+                "Type {} started",
+                workerTask.getTask().getClass().getSimpleName()
+            );
+
+            workerTask = workerTask.withTaskRun(workerTask.getTaskRun().withState(RUNNING));
+
+            runContext = providedRunContext != null ? providedRunContext : runContextInitializer.forWorker(workerTask);
+
+            Optional<String> hash = Optional.empty();
+            if (workerTask.getTask().getTaskCache() != null && workerTask.getTask().getTaskCache().getEnabled()) {
+                runContext.logger().debug("Task output caching is enabled for task '{}''", workerTask.getTask().getId());
+                hash = hashTask(runContext, workerTask.getTask());
+                if (hash.isPresent()) {
+                    Optional<WorkerTaskResult> cachedResult = loadFromCache(runContext, workerTask, hash.get());
+                    if (cachedResult.isPresent()) {
+                        WorkerTaskResult workerTaskResult = cachedResult.get();
+                        workerTaskResultQueue.put(workerTaskResult);
+                        return workerTaskResult;
+                    }
+                }
+            }
+
+            // run
+            TaskRunWithOutput taskRunWithOutput = this.runAttempt(runContext, workerTask);
+
+            // get last state
+            TaskRunAttempt lastAttempt = taskRunWithOutput.taskRun().lastAttempt();
+            if (lastAttempt == null) {
+                throw new IllegalStateException(
+                    "Can find lastAttempt on taskRun '" +
+                        workerTask.getTaskRun().toString(true) + "'"
+                );
+            }
+            io.kestra.core.models.flows.State.Type state = lastAttempt.getState().getCurrent();
+
+            if (isInterruptedForResubmission(state)) {
+                // The Worker is terminating and forcibly interrupted this still-running task (grace period
+                // elapsed or force shutdown), so its failed state is an artifact of the shutdown, not a real
+                // failure: we return immediately without emitting any result as it will be resubmitted
+                // (except if WorkerTaskRestartStrategy is NEVER).
+                // A task that reached a FAILED state on its own during the drain window is NOT interrupted
+                // (isShutdownInterrupted() is false), so it falls through and its terminal result is emitted —
+                // otherwise its genuine failure would be silently dropped and the execution stuck RUNNING.
+                List<WorkerTaskResult> dynamicWorkerResults = runContext.dynamicWorkerResults();
+                List<TaskRun> dynamicTaskRuns = dynamicWorkerResults(dynamicWorkerResults);
+                return new WorkerTaskResult(taskRunWithOutput.taskRun(), dynamicTaskRuns, taskRunWithOutput.outputs());
+            }
+
+            if (
+                workerTask.getTask().getRetry() != null &&
+                    workerTask.getTask().getRetry().getWarningOnRetry() &&
+                    taskRunWithOutput.taskRun().attemptNumber() > 1 &&
+                    state == SUCCESS
+            ) {
+                state = WARNING;
+            }
+
+            if (taskRunWithOutput.assetEmission() == TaskRunWithOutput.AssetEmission.DECLARATION_INVALID) {
+                // never rewrite a state that already terminated in error, mirroring AssetFailureBehavior.apply
+                if (!state.isTerminatedInError()) {
+                    runContext.logger().error(
+                        "Task state changed from {} to {} because its asset declaration is invalid, which assetFailureBehavior does not soften",
+                        state, FAILED
+                    );
+                    state = FAILED;
+                }
+            } else if (taskRunWithOutput.assetEmission() == TaskRunWithOutput.AssetEmission.LOCKS_NOT_RELEASED) {
+                if (!state.isTerminatedInError()) {
+                    runContext.logger().error(
+                        "Task state changed from {} to {} because the assets it locked could not be released, which assetFailureBehavior does not soften",
+                        state, FAILED
+                    );
+                    state = FAILED;
+                }
+            } else if (taskRunWithOutput.assetEmission() == TaskRunWithOutput.AssetEmission.FAILED) {
+                AssetFailureBehavior assetFailureBehavior = TaskAttemptAssets.assetFailureBehavior(runContext, workerTask);
+                State.Type newState = assetFailureBehavior.apply(state);
+                if (newState != state) {
+                    runContext.logger().warn(
+                        "Task state changed from {} to {} because an asset failed to be emitted (assetFailureBehavior: {})",
+                        state, newState, assetFailureBehavior
+                    );
+                } else {
+                    runContext.logger().warn(
+                        "An asset failed to be emitted but the task state was not changed (assetFailureBehavior: {})",
+                        assetFailureBehavior
+                    );
+                }
+                state = newState;
+            }
+
+            // allowFailure has final say over any FAILED state reaching this point, whether the task's own
+            // genuine failure or one escalated by assetFailureBehavior; gated on shouldBeRetried so a pending retry
+            // is not prematurely softened
+            if (workerTask.getTask().isAllowFailure() && !taskRunWithOutput.taskRun().shouldBeRetried(workerTask.getTask().getRetry()) && state.isFailed()) {
+                state = WARNING;
+            }
+
+            if (workerTask.getTask().isAllowWarning() && WARNING.equals(state)) {
+                state = SUCCESS;
+            }
+
+            // emit
+            List<WorkerTaskResult> dynamicWorkerResults = runContext.dynamicWorkerResults();
+            List<TaskRun> dynamicTaskRuns = dynamicWorkerResults(dynamicWorkerResults);
+
+            TaskRun taskRun = taskRunWithOutput.taskRun().withState(state);
+
+            WorkerTaskResult workerTaskResult = new WorkerTaskResult(taskRun, dynamicTaskRuns, taskRunWithOutput.outputs());
+            // upload the cache file before emitting the result so that an execution started right after this one sees the entry
+            // hash may not be present if we didn't succeed in computing it
+            if (
+                workerTask.getTask().getTaskCache() != null && workerTask.getTask().getTaskCache().getEnabled() && hash.isPresent() &&
+                    (state == State.Type.SUCCESS || state == State.Type.WARNING)
+            ) {
+                try {
+                    uploadCacheEntry(runContext, workerTask, taskRunWithOutput, hash.get(), taskRun);
+                } catch (IOException | RuntimeException e) {
+                    // in case of any exception, log an error and continue
+                    runContext.logger().error("Unexpected exception while uploading the cache entry for task '{}', the task not be cached.", workerTask.getTask().getId(), e);
+                }
+            }
+
+            workerTaskResultQueue.put(workerTaskResult);
+
+            this.logTerminated(workerTask, taskRun);
+            return workerTaskResult;
+        } finally {
+
+            // remove tmp directory
+            if (cleanUp && runContext != null) {
+                runContext.cleanup();
+            }
+        }
+    }
+
+    private Optional<WorkerTaskResult> loadFromCache(RunContext runContext, WorkerTask workerTask, String hash) {
+        try {
+            Optional<InputStream> cacheFile = runContext.storage().getCacheFile(hash, workerTask.getTaskRun().getValue(), workerTask.getTask().getTaskCache().getTtl());
+            if (cacheFile.isEmpty()) {
+                return Optional.empty();
+            }
+
+            runContext.logger().info("Skipping task execution for task '{}' as there is an existing cache entry for it", workerTask.getTask().getId());
+            Map<String, Object> outputMap;
+            try (ZipInputStream archive = new ZipInputStream(cacheFile.get())) {
+                if (archive.getNextEntry() == null) {
+                    return Optional.empty();
+                }
+                byte[] cache = archive.readAllBytes();
+                outputMap = JacksonMapper.ofIon().readValue(cache, JacksonMapper.MAP_TYPE_REFERENCE);
+            }
+
+            TaskRunAttempt attempt = TaskRunAttempt.builder()
+                .state(new io.kestra.core.models.flows.State().withState(SUCCESS))
+                .workerId(this.workerId)
+                .build();
+            List<TaskRunAttempt> attempts = this.addAttempt(workerTask, attempt);
+            TaskRun taskRun = workerTask.getTaskRun().withAttempts(attempts).withState(SUCCESS);
+            return Optional.of(new WorkerTaskResult(taskRun, outputMap));
+        } catch (IOException | RuntimeException e) {
+            // in case of any exception, log an error and continue
+            runContext.logger().error("Unexpected exception while loading the cache for task '{}', the task will be executed instead.", workerTask.getTask().getId(), e);
+            return Optional.empty();
+        }
+    }
+
+    private void uploadCacheEntry(RunContext runContext, WorkerTask workerTask, TaskRunWithOutput taskRunWithOutput, String hash, TaskRun taskRun) throws IOException {
+        runContext.logger().info("Uploading a cache entry for task '{}'", workerTask.getTask().getId());
+
+        Path archiveFile = runContext.workingDir().createTempFile(".zip");
+        try (
+            OutputStream os = Files.newOutputStream(archiveFile);
+            ZipOutputStream archive = new ZipOutputStream(os)
+        ) {
+            var zipEntry = new ZipEntry("outputs.ion");
+            archive.putNextEntry(zipEntry);
+            archive.write(JacksonMapper.ofIonBinary().writeValueAsBytes(taskRunWithOutput.outputs()));
+            archive.closeEntry();
+            archive.finish();
+        }
+        URI uri = runContext.storage().putCacheFile(archiveFile.toFile(), hash, taskRun.getValue());
+        runContext.logger().debug("Caching entry uploaded in URI {}", uri);
+    }
+
+    private void logTerminated(WorkerTask workerTask, TaskRun taskRun) {
+        final String[] tags = metricRegistry.tags(workerTask, workerGroup);
+
+        metricRegistry
+            .counter(MetricRegistry.METRIC_WORKER_ENDED_COUNT, MetricRegistry.METRIC_WORKER_ENDED_COUNT_DESCRIPTION, tags)
+            .increment();
+
+        metricRegistry
+            .timer(MetricRegistry.METRIC_WORKER_ENDED_DURATION, MetricRegistry.METRIC_WORKER_ENDED_DURATION_DESCRIPTION, tags)
+            .record(workerTask.getTaskRun().getState().getDurationOrComputeIt());
+
+        Logs.logTaskRun(
+            taskRun,
+            Level.INFO,
+            "Type {} with state {} completed in {}",
+            workerTask.getTask().getClass().getSimpleName(),
+            taskRun.getState().getCurrent(),
+            taskRun.getState().humanDuration()
+        );
+    }
+
+    private TaskRunWithOutput runAttempt(final RunContext runContext, final WorkerTask workerTask) {
+        Logger logger = runContext.logger();
+
+        if (!(workerTask.getTask() instanceof RunnableTask<?> task)) {
+            // This should never happen but better to deal with it than crashing the Worker
+            var state = State.Type.fail(workerTask.getTask());
+            TaskRunAttempt attempt = TaskRunAttempt.builder()
+                .state(new io.kestra.core.models.flows.State().withState(state))
+                .workerId(this.workerId)
+                .build();
+            List<TaskRunAttempt> attempts = this.addAttempt(workerTask, attempt);
+            TaskRun taskRun = workerTask.getTaskRun().withAttempts(attempts);
+            logger.error(
+                "Unable to execute the task '{}': only runnable tasks can be executed by the worker but the task is of type {}", workerTask.getTask().getId(), workerTask.getTask().getClass()
+            );
+            return new TaskRunWithOutput(taskRun, null);
+        }
+
+        TaskRunAttempt.TaskRunAttemptBuilder builder = TaskRunAttempt.builder()
+            .state(new io.kestra.core.models.flows.State().withState(RUNNING))
+            .workerId(this.workerId);
+
+        // emit the attempt so the execution knows that the task is in RUNNING
+        workerTaskResultQueue.put(
+            new WorkerTaskResult(
+                workerTask.getTaskRun()
+                    .withAttempts(this.addAttempt(workerTask, builder.build()))
+            )
+        );
+
+        TaskAttemptAssets assets = new TaskAttemptAssets(runContext, workerTask);
+        assets.emitAtStart();
+
+        io.kestra.core.models.flows.State.Type state;
+        WorkerTaskCallable workerTaskCallable = null;
+        if (!assets.isRefusedByALock()) {
+            AtomicInteger metricRunningCount = getMetricRunningCount(workerTask);
+            metricRunningCount.incrementAndGet();
+
+            // run it
+            workerTaskCallable = new WorkerTaskCallable(workerTask, task, runContext, metricRegistry, workerGroup);
+            state = callJob(workerTaskCallable);
+
+            metricRunningCount.decrementAndGet();
+        } else {
+            logger.error("The task was not run because another owner locked the assets it writes: {}", String.join(" ", assets.lockRefusals()));
+            state = FAILED;
+        }
+
+        // attempt
+        TaskRunAttempt taskRunAttempt = builder
+            .build()
+            .withState(state)
+            .withLogFile(runContext.logFileURI());
+
+        // metrics
+        runContext.metrics()
+            .stream()
+            .map(metric -> MetricEntry.of(workerTask.getTaskRun(), metric, workerTask.getExecutionKind()))
+            .forEach(workerMetricQueue::put);
+
+        // save outputs
+        List<TaskRunAttempt> attempts = this.addAttempt(workerTask, taskRunAttempt);
+
+        TaskRun taskRun = workerTask.getTaskRun()
+            .withAttempts(attempts);
+
+        Map<String, Object> outputs = Optional.ofNullable(workerTaskCallable).map(WorkerTaskCallable::getTaskOutput).map(it -> it.toMap()).orElse(null);
+
+        TaskRunWithOutput.AssetEmission assetEmission = assets.emitAtEnd(taskRun, state, outputs, isInterruptedForResubmission(state));
+
+        return new TaskRunWithOutput(taskRun, outputs, assetEmission);
+    }
+
+    private boolean isInterruptedForResubmission(io.kestra.core.models.flows.State.Type state) {
+        return isStopped() && isShutdownInterrupted() && serverConfig.workerTaskRestartStrategy() != WorkerTaskRestartStrategy.NEVER && state.isFailed();
+    }
+
+    private List<TaskRunAttempt> addAttempt(WorkerTask workerTask, TaskRunAttempt taskRunAttempt) {
+        return ImmutableList.<TaskRunAttempt> builder()
+            .addAll(workerTask.getTaskRun().getAttempts() == null ? new ArrayList<>() : workerTask.getTaskRun().getAttempts())
+            .add(taskRunAttempt)
+            .build();
+    }
+
+    private Optional<String> hashTask(RunContext runContext, Task task) {
+        try {
+            var map = JacksonMapper.toMap(task);
+            // If there are task provided variables, rendering the task may fail.
+            // The best we can do is to add a fake 'workingDir' as it's an often added variables,
+            // and it should not be part of the task hash.
+            Map<String, Object> variables = Map.of("workingDir", "workingDir");
+            var rMap = runContext.render(map, variables);
+            var json = JacksonMapper.ofJson().writeValueAsBytes(rMap);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(json);
+            byte[] bytes = digest.digest();
+            return Optional.of(HexFormat.of().formatHex(bytes));
+        } catch (RuntimeException | IllegalVariableEvaluationException | JsonProcessingException | NoSuchAlgorithmException e) {
+            runContext.logger().error("Unable to create the cache key for the task '{}'", task.getId(), e);
+            return Optional.empty();
+        }
+    }
+
+    private List<TaskRun> dynamicWorkerResults(List<WorkerTaskResult> dynamicWorkerResults) {
+        return dynamicWorkerResults
+            .stream()
+            .map(WorkerTaskResult::getTaskRun)
+            .map(taskRun -> taskRun.withDynamic(true))
+            .toList();
+    }
+
+    private AtomicInteger getMetricRunningCount(final WorkerTask workerTask) {
+        String[] tags = this.metricRegistry.tags(workerTask, workerGroup);
+
+        long index = Hashing.hashToLong(String.join("-", tags));
+
+        return METRIC_RUNNING_COUNT
+            .computeIfAbsent(
+                index, _ -> metricRegistry.gauge(
+                    MetricRegistry.METRIC_WORKER_TASKS_RUNNING_COUNT,
+                    MetricRegistry.METRIC_WORKER_TASKS_RUNNING_COUNT_DESCRIPTION,
+                    new AtomicInteger(0),
+                    tags
+                )
+            );
+    }
+}

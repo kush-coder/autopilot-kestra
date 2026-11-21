@@ -1,0 +1,15 @@
+@use "reboot";
+
+// vendor
+@use "element-plus.scss";
+@use "vue-material-design-icons/styles.css";
+
+// css variables
+@use "fonts";
+@use "ks-tokens";
+@use "ks-palette";
+@use "ks-theme-light";
+@use "ks-theme-dark";
+@use "ks-theme-dark-2";
+
+@use "global";

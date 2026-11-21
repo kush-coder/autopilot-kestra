@@ -1,0 +1,91 @@
+<template>
+    <ElForm ref="formRef" v-bind="({...filteredProps(), ...$attrs} as FormProps)" @submit="emit('submit', $event)">
+        <template v-if="$slots.default" #default>
+            <slot />
+        </template>
+    </ElForm>
+</template>
+
+<script setup lang="ts">
+    import {ref, type HTMLAttributes} from "vue"
+    import {ElForm, type FormInstance, type FormProps, type FormValidateCallback} from "element-plus"
+    import {usePassedProps} from "../../../utils/filteredProps"
+    import type {NativeAttributes} from "../../../utils/nativeAttributes"
+
+    defineOptions({inheritAttrs: false})
+
+    const props = defineProps<FormProps & /* @vue-ignore */ Omit<NativeAttributes<HTMLAttributes>, keyof FormProps>>()
+
+    const emit = defineEmits<{
+        submit: [evt: Event]
+    }>()
+
+    defineSlots<{
+        default?(): unknown
+    }>()
+
+    const formRef = ref<InstanceType<typeof ElForm>>()
+
+    const filteredProps = usePassedProps(props)
+
+    defineExpose({
+        validate: (callback: FormValidateCallback) => formRef.value?.validate(callback),
+        resetFields: (...args: Parameters<FormInstance["resetFields"]>) => formRef.value?.resetFields(...args),
+        clearValidate: (...args: Parameters<FormInstance["clearValidate"]>) => formRef.value?.clearValidate(...args),
+        validateField: (...args: Parameters<FormInstance["validateField"]>) => formRef.value?.validateField(...args),
+        scrollToField: (prop: string) => formRef.value?.scrollToField(prop),
+    })
+</script>
+
+<style lang="scss">
+    @use '../../../assets/styles/el-ns';
+    @use 'element-plus/theme-chalk/src/form';
+</style>
+
+<style>
+    .kel-form {
+        &.kel-form--small {
+            &.kel-form--label-top .kel-form-item__label {
+                margin-bottom: 0;
+            }
+        }
+    }
+
+    form.ks-horizontal {
+        & .kel-form-item {
+            @media only screen and (max-width: 767px) {
+                display: block;
+            }
+
+            @media only screen and (min-width: 768px) {
+                --label-size: 16.6666666667%;
+
+                &.small {
+                    --label-size: calc(16.6666666667% / 2);
+                }
+
+                & .kel-form-item__label {
+                    max-width: var(--label-size);
+                    flex: 0 0 var(--label-size);
+                    text-align: right;
+                }
+
+                & .kel-form-item__content {
+                    align-items: flex-start;
+                    max-width: calc(100% - var(--label-size));
+                    flex: 0 0 calc(100% - var(--label-size));
+                }
+            }
+        }
+
+        & .submit {
+            text-align: right;
+
+            & .kel-form-item__content {
+                justify-content: end;
+                max-width: unset;
+                flex: 1;
+            }
+        }
+    }
+</style>

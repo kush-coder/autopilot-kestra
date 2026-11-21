@@ -1,0 +1,67 @@
+import {createI18n} from "vue-i18n"
+import {memoryRouter} from "../../../memoryRouter"
+import en from "../../../../../src/translations/en.json"
+
+/**
+ * Real `en` messages so `ai.copilot.*` keys resolve to actual copy (catches typos /
+ * shadowed keys), warnings silenced.
+ */
+export const i18n = createI18n({legacy: false, locale: "en", fallbackWarn: false, missingWarn: false, messages: en})
+
+/**
+ * Lightweight functional stubs for the design-system components the copilot uses.
+ * The real DS pulls in `@popperjs/core` (CJS) which breaks the jsdom unit env, and
+ * these tests target the copilot components' own logic — not Element Plus rendering.
+ * Each stub keeps just enough behaviour (v-model, click, disabled, slots) to assert
+ * wiring, and lets `data-test` / listeners fall through to its root element.
+ */
+export const ksStubs = {
+    KsInput: {
+        name: "KsInput",
+        props: ["modelValue", "disabled", "placeholder", "type", "autosize", "rows"],
+        emits: ["update:modelValue"],
+        template: `<textarea
+            :disabled="disabled"
+            :placeholder="placeholder"
+            :value="modelValue"
+            @input="$emit('update:modelValue', $event.target.value)"
+        ></textarea>`,
+    },
+    KsButton: {
+        name: "KsButton",
+        props: ["icon", "disabled", "type", "ariaLabel"],
+        emits: ["click"],
+        template: "<button :disabled=\"disabled\" @click=\"$emit('click')\"><slot /></button>",
+    },
+    KsDropdown: {name: "KsDropdown", props: ["trigger"], template: "<div class=\"ks-dropdown\"><slot /><slot name=\"dropdown\" /></div>"},
+    KsDropdownMenu: {name: "KsDropdownMenu", template: "<div class=\"ks-dropdown-menu\"><slot /></div>"},
+    KsId: {name: "KsId", props: ["value", "shrink"], template: "<span>{{ value }}<slot /></span>"},
+    KsDropdownItem: {name: "KsDropdownItem", emits: ["click"], template: "<button class=\"ks-dropdown-item\" @click=\"$emit('click')\"><slot /></button>"},
+    KsCard: {name: "KsCard", template: "<div><slot /></div>"},
+    KsText: {name: "KsText", props: ["size", "type"], template: "<span><slot /></span>"},
+    KsIcon: {name: "KsIcon", template: "<i><slot /></i>"},
+    KsBadge: {name: "KsBadge", props: ["value", "type", "inline"], template: "<span class=\"ks-badge\">{{ value }}</span>"},
+    KsTag: {name: "KsTag", props: ["size", "type"], template: "<span class=\"ks-tag\" :data-type=\"type\"><slot /></span>"},
+    KsAlert: {name: "KsAlert", props: ["type", "closable", "title"], template: "<div class=\"ks-alert\" :data-type=\"type\"><strong v-if=\"title\">{{ title }}</strong><slot /></div>"},
+    KsTooltip: {name: "KsTooltip", props: ["content", "disabled", "visible", "trigger", "persistent"], template: "<div class=\"ks-tooltip\" :data-tooltip=\"disabled ? undefined : content\" :data-visible=\"visible ? 'true' : 'false'\"><span class=\"ks-tooltip-content\"><slot name=\"content\" /></span><slot /></div>"},
+    KsCodeStatus: {name: "KsCodeStatus", props: ["status", "label", "iconOnly"], template: "<span class=\"ks-code-status\" :data-status=\"status\"><slot>{{ label }}</slot></span>"},
+    KsScrollbar: {name: "KsScrollbar", template: "<div><slot /></div>"},
+    KsMarkdown: {name: "KsMarkdown", props: ["content"], template: "<div class=\"ks-markdown\">{{ content }}</div>"},
+    KsTabs: {name: "KsTabs", props: ["modelValue", "type"], emits: ["update:modelValue"], template: "<div><slot /></div>"},
+    KsTabPane: {name: "KsTabPane", props: ["name", "label"], template: "<span>{{ label }}</span>"},
+    KsCollapse: {name: "KsCollapse", props: ["modelValue"], template: "<div><slot /></div>"},
+    KsCollapseItem: {name: "KsCollapseItem", props: ["name", "title"], template: "<div><span class=\"collapse-title\"><slot name=\"title\">{{ title }}</slot></span><slot /></div>"},
+    // DiffView renders a real Monaco KsEditor in diff mode — too heavy for jsdom, and the copilot
+    // components only need to assert what's passed to it (`original`/`modelValue`), not that Monaco
+    // itself renders a diff.
+    KsEditor: {name: "KsEditor", props: ["modelValue", "original", "lang", "readOnly", "options"], template: "<div data-test=\"ks-editor\" />"},
+}
+
+/** Common `global` mount option for copilot component tests. */
+export const mountGlobal = {
+    get plugins() {
+        return [i18n, memoryRouter()]
+    },
+    stubs: ksStubs,
+    directives: {ksLoading: {}},
+}

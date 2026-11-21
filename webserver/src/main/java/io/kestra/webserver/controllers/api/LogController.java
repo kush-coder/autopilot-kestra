@@ -1,0 +1,209 @@
+package io.kestra.webserver.controllers.api;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+
+import org.slf4j.event.Level;
+
+import io.kestra.core.models.QueryFilter;
+import io.kestra.core.models.QueryFilter.Resource;
+import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.repositories.LogDataStoreInterface;
+import io.kestra.core.runners.FollowLogEvent;
+import io.kestra.core.services.ExecutionLogService;
+import io.kestra.core.services.ExecutionService;
+import io.kestra.core.services.LogStreamingService;
+import io.kestra.core.tenant.TenantService;
+import io.kestra.webserver.converters.QueryFilterFormat;
+import io.kestra.webserver.responses.CursorOrOffsetPagedResults;
+import io.kestra.webserver.services.SseConnectionMetrics;
+import io.kestra.webserver.utils.PageableUtils;
+import io.kestra.webserver.utils.QueryFilterUtils;
+import io.kestra.webserver.models.api.Pagination;
+
+import io.micronaut.context.annotation.Requires;
+import io.micronaut.core.annotation.Nullable;
+import io.micronaut.data.model.Pageable;
+import io.micronaut.http.HttpHeaders;
+import io.micronaut.http.HttpResponse;
+import io.micronaut.http.MediaType;
+import io.micronaut.http.annotation.*;
+import io.micronaut.http.exceptions.HttpStatusException;
+import io.micronaut.http.sse.Event;
+import io.micronaut.scheduling.TaskExecutors;
+import io.micronaut.scheduling.annotation.ExecuteOn;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.ExampleObject;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import jakarta.inject.Inject;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.Valid;
+import reactor.core.publisher.Flux;
+
+@Controller("/api/v1/{tenant}/logs")
+@Requires(beans = LogDataStoreInterface.class)
+public class LogController {
+    @Inject
+    private LogDataStoreInterface logRepository;
+
+    @Inject
+    private ExecutionLogService logService;
+
+    @Inject
+    private TenantService tenantService;
+
+    @Inject
+    private LogStreamingService logStreamingService;
+    @Inject
+    private ExecutionService executionService;
+    @Inject
+    private SseConnectionMetrics sseConnectionMetrics;
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get(uri = "/search")
+    @Operation(tags = { "Logs" }, summary = "Search for logs")
+    public CursorOrOffsetPagedResults<LogEntry> searchLogs(
+        @Valid @RequestBean Pagination paging,
+        @Parameter(description = "An opaque cursor token (from a previous response's nextCursor) for cursor-paginated log stores")
+        @Nullable @QueryValue String cursor,
+        @Parameter(
+            description = "Filters. PHP-style nested query is used - examples: `filters[flowId][EQUALS]=hello-world`, `filters[timeRange][EQUALS]=P7D`, `filters[level][EQUALS]=DEBUG`",
+            in = ParameterIn.QUERY
+        ) @Nullable @QueryFilterFormat(Resource.LOG) List<QueryFilter> filters)
+        throws HttpStatusException {
+        Pageable offsetPageable = paging.toPageable();
+        // A cursor param targets a cursor-paginated store (e.g. an external log store): resume after the
+        // opaque token (the store interprets it). Otherwise use offset pagination (the default for JDBC/Elasticsearch).
+        Pageable pageable = cursor != null
+            ? Pageable.afterCursor(Pageable.Cursor.of(cursor), paging.page(), paging.size(), offsetPageable.getSort())
+            : offsetPageable;
+
+        return CursorOrOffsetPagedResults.of(
+            logRepository.find(
+                pageable,
+                tenantService.resolveTenant(),
+                QueryFilterUtils.replaceTimeRangeWithComputedStartDateFilter(filters)
+            )
+        );
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get(uri = "/{executionId}")
+    @Operation(tags = { "Logs" }, summary = "Get logs for a specific execution, taskrun or task", description = "All logs are returned unless `page` or `size` is set.")
+    public List<LogEntry> listLogsFromExecution(
+        @Parameter(description = "The execution id") @PathVariable String executionId,
+        @Parameter(description = "The current page, enables pagination when set") @Nullable @QueryValue @Min(1) Integer page,
+        @Parameter(description = "The current page size, enables pagination when set (defaults to 10)") @Nullable @QueryValue @Min(1) @Max(PageableUtils.MAX_PAGE_SIZE) Integer size,
+        @Parameter(description = "The sort of the page, defaults to `timestamp:asc`", examples = {
+            @ExampleObject(name = "Sort by timestamp in descending order", value = "timestamp:desc")
+        }) @Nullable @QueryValue List<String> sort,
+        @Parameter(description = "Filters") @Nullable @QueryFilterFormat(Resource.LOG) List<QueryFilter> filters) {
+        if (page != null || size != null) {
+            return logRepository.find(
+                PageableUtils.from(page == null ? 1 : page, size == null ? 10 : size, sort == null ? List.of("timestamp:asc") : sort),
+                tenantService.resolveTenant(),
+                buildExecutionFilters(executionId, filters)
+            ).getContent();
+        }
+
+        return logRepository
+            .findAsync(tenantService.resolveTenant(), buildExecutionFilters(executionId, filters))
+            .collectList()
+            .block();
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get(uri = "/{executionId}/download", produces = MediaType.TEXT_PLAIN)
+    @Operation(tags = { "Logs" }, summary = "Download logs for a specific execution, taskrun or task")
+    @ApiResponse(
+        responseCode = "200",
+        description = "downloadLogsFromExecution 200 response",
+        content = @Content(mediaType = MediaType.TEXT_PLAIN, schema = @Schema(type = "string", format = "binary"))
+    )
+    public HttpResponse<Flux<String>> downloadLogsFromExecution(
+        @Parameter(description = "The execution id") @PathVariable String executionId,
+        @Parameter(description = "Filters") @Nullable @QueryFilterFormat(Resource.LOG) List<QueryFilter> filters) {
+        // `private`, not `public`: these logs are tenant-scoped, so a shared cache must not replay
+        // them to a different requester, even though a terminated execution's logs never change.
+        String cacheControl = executionService.getExecution(tenantService.resolveTenant(), executionId, false).getState().getCurrent().isTerminated()
+            ? "private, max-age=86400"
+            : "no-cache";
+
+        Flux<String> lines = logRepository
+            .findAsync(tenantService.resolveTenant(), buildExecutionFilters(executionId, filters))
+            .index((index, log) -> (index == 0 ? "" : "\n") + LogEntry.toPrettyString(log));
+
+        return HttpResponse.ok(lines)
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + executionId + ".log\"; filename*=utf-8''" + executionId + ".log")
+            .header(HttpHeaders.CACHE_CONTROL, cacheControl);
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get(uri = "/{executionId}/follow", produces = MediaType.TEXT_EVENT_STREAM)
+    @Operation(tags = { "Logs" }, summary = "Follow logs for a specific execution")
+    public Flux<Event<FollowLogEvent>> followLogsFromExecution(
+        @Parameter(description = "The execution id") @PathVariable String executionId,
+        @Parameter(description = "Filters") @Nullable @QueryFilterFormat(Resource.LOG) List<QueryFilter> filters) {
+        String subscriberId = UUID.randomUUID().toString();
+        List<QueryFilter> effectiveFilters = buildExecutionFilters(executionId, filters);
+
+        Flux<Event<FollowLogEvent>> flux = logStreamingService
+            .follow(executionId, subscriberId, logRepository.findAsync(tenantService.resolveTenant(), effectiveFilters), effectiveFilters)
+            .timeout(Duration.ofHours(1)); // avoid idle SSE sockets by setting a between-item timeout
+
+        return sseConnectionMetrics.track(
+            flux, "logs",
+            () -> logStreamingService.unregisterSubscriber(executionId, subscriberId)
+        );
+    }
+
+    /**
+     * Build the QueryFilter list for the per-execution endpoints. Purely additive: the
+     * path-variable {@code executionId} is always appended as an EQUALS filter, and any
+     * user-supplied filters (including a user-supplied {@code executionId} filter) are kept
+     * verbatim. The combined filter set is AND-ed by the repository, so a conflicting user
+     * filter just narrows the result to nothing — the URL path stays authoritative.
+     */
+    private static List<QueryFilter> buildExecutionFilters(String executionId, List<QueryFilter> userFilters) {
+        List<QueryFilter> merged = new java.util.ArrayList<>();
+        if (userFilters != null) {
+            merged.addAll(userFilters);
+        }
+        merged.add(
+            QueryFilter.builder()
+                .field(QueryFilter.Field.EXECUTION_ID)
+                .operation(QueryFilter.Op.EQUALS)
+                .value(executionId)
+                .build()
+        );
+        return merged;
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Delete(uri = "/{executionId}")
+    @Operation(tags = { "Logs" }, summary = "Delete logs for a specific execution, taskrun or task")
+    public void deleteLogsFromExecution(
+        @Parameter(description = "The execution id") @PathVariable String executionId,
+        @Parameter(description = "The min log level filter") @Nullable @QueryValue Level minLevel,
+        @Parameter(description = "The taskrun id") @Nullable @QueryValue String taskRunId,
+        @Parameter(description = "The task id") @Nullable @QueryValue String taskId,
+        @Parameter(description = "The attempt number") @Nullable @QueryValue Integer attempt) {
+        logRepository.deleteByQuery(tenantService.resolveTenant(), executionId, taskId, taskRunId, minLevel, attempt);
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Delete(uri = "/{namespace}/{flowId}")
+    @Operation(tags = { "Logs" }, summary = "Delete logs for a specific execution, taskrun or task")
+    public void deleteLogsFromFlow(
+        @Parameter(description = "The namespace") @PathVariable String namespace,
+        @Parameter(description = "The flow identifier") @PathVariable String flowId,
+        @Parameter(description = "The trigger id") @Nullable @QueryValue String triggerId) {
+        logRepository.deleteByQuery(tenantService.resolveTenant(), namespace, flowId, triggerId);
+    }
+}

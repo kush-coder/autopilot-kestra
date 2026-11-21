@@ -1,0 +1,279 @@
+<template>
+    <ContextInfoContent :title="routeInfo.title" ref="contextInfoRef">
+        <template v-if="isOnline && !isHomepage" #back-button>
+            <KsButton
+                class="back-button"
+                nativeType="button"
+                @click="goBack"
+                :disabled="!canGoBack"
+                :class="{disabled: !canGoBack}"
+                :aria-label="$t('common.back')"
+            >
+                <ChevronLeft class="back-icon" />
+            </KsButton>
+        </template>
+        <template #header>
+            <router-link
+                :to="{
+                    name: 'docs/view',
+                    params:{
+                        path:docsRoutePath
+                    }
+                }"
+                target="_blank"
+                :aria-label="$t('common.openInNewTab')"
+            >
+                <OpenInNew class="blank" />
+            </router-link>
+        </template>
+        <div class="docs-controls">
+            <template v-if="isOnline">
+                <div class="docs-toolbar">
+                    <ContextDocsSearch />
+                    <DocsMenu />
+                </div>
+                <DocsLayout>
+                    <template #content>
+                        <!-- A new page gets new components: embedded ones like ChildCard load their data once, when they mount. -->
+                        <KsMarkdown
+                            :key="renderedDocPath"
+                            class="markdown"
+                            lead
+                            :content="markdownContent"
+                            :components="markdownComponents"
+                        />
+                    </template>
+                </DocsLayout>
+            </template>
+            <KsMarkdown v-else :content="OFFLINE_MD" class="offline-markdown" />
+        </div>
+    </ContextInfoContent>
+</template>
+
+<script setup lang="ts">
+    import {ref, watch, computed, onUnmounted, provide} from "vue"
+    import {useDocStore, type DocMetadata} from "../../stores/doc"
+    import OpenInNew from "vue-material-design-icons/OpenInNew.vue"
+    import ChevronLeft from "vue-material-design-icons/ChevronLeft.vue"
+    import DocsLayout from "./DocsLayout.vue"
+    import ContextDocsLink from "./ContextDocsLink.vue"
+    import ContextChildCard from "./ContextChildCard.vue"
+    import DocsMenu from "./ContextDocsMenu.vue"
+    import ContextDocsSearch from "./ContextDocsSearch.vue"
+    import ContextInfoContent from "../ContextInfoContent.vue"
+    import ContextChildTableOfContents from "./ContextChildTableOfContents.vue"
+    import {DOC_PATH_INJECTION_KEY, removeMDXImports, extractMultilineJSXComponents, replaceSelfClosingTagsWithOpenClose} from "./docsUtils"
+
+    import {useI18n} from "vue-i18n"
+    const {t} = useI18n({useScope: "global"})
+
+    import {useNetwork} from "@vueuse/core"
+    import {useScrollMemory} from "../../composables/useScrollMemory"
+    const {isOnline} = useNetwork()
+
+    import {KsButton, KsMarkdown} from "@kestra-io/design-system"
+    import PluginCount from "./PluginCount.vue"
+    import WhatsNew from "../content/WhatsNew.vue"
+    import SupportLinks from "../content/SupportLinks.vue"
+    import BigChildCards from "../content/BigChildCards.vue"
+    import CardLogos from "../content/CardLogos.vue"
+    import ChildReleases from "../content/ChildReleases.vue"
+    import DownloadLogoPack from "../content/DownloadLogoPack.vue"
+    import HomePageButtons from "../content/HomePageButtons.vue"
+    import HomePageHeader from "../content/HomePageHeader.vue"
+    import ProseImg from "../content/ProseImg.vue"
+    import ApiDoc from "../content/ApiDoc.vue"
+    import ApiDocee from "../content/ApiDocee.vue"
+
+    const markdownComponents = {
+        a: ContextDocsLink,
+        img: ProseImg,
+        ApiDoc: ApiDoc,
+        ApiDocEE: ApiDocee,
+        ApiDocee: ApiDocee,
+        BigChildCards: BigChildCards,
+        CardLogos: CardLogos,
+        ChildCard: ContextChildCard,
+        ChildReleases: ChildReleases,
+        ChildTableOfContents: ContextChildTableOfContents,
+        DownloadLogoPack: DownloadLogoPack,
+        GuidesChildCard: ContextChildCard,
+        HomePageButtons: HomePageButtons,
+        HomePageHeader: HomePageHeader,
+        PluginCount: PluginCount,
+        SupportLinks: SupportLinks,
+        WhatsNew: WhatsNew,
+    }
+
+    const OFFLINE_MD = "You're seeing this because you are offline.\n\nHere's how to configure the right sidebar in Kestra to include custom links:\n\n```yaml\nkestra:\n  ee:\n    right-sidebar:\n      custom-links:\n        internal-docs:\n          title: \"Internal Docs\"\n          url: \"https://kestra.io/docs/\"\n        support-portal:\n          title: \"Support portal\"\n          url: \"https://kestra.io/support/\"\n```"
+
+    const docStore = useDocStore()
+
+    const contextInfoRef = ref<InstanceType<typeof ContextInfoContent> | null>(null)
+    const docHistory = ref<string[]>([])
+    const currentHistoryIndex = ref(-1)
+    const markdownContent = ref<string>("")
+    const renderedDocPath = ref("docs")
+
+    const pageMetadata = computed(() => docStore.pageMetadata)
+    const isHomepage = computed(() => pageMetadata.value?.isHomepage === true)
+    const docPath = computed(() => docStore.docPath)
+    provide(DOC_PATH_INJECTION_KEY, computed(() => renderedDocPath.value))
+    const docsRoutePath = computed(() => docPath.value?.replace(/^docs(\/|$)/, ""))
+
+    const routeInfo = computed(() => ({
+        title: pageMetadata.value?.title ?? t("docs"),
+    }))
+    const canGoBack = computed(() => docHistory.value.length > 1 && currentHistoryIndex.value > 0)
+    const addToHistory = (path: string) => {
+        // Always store the path, even empty ones
+        const pathToAdd = path || ""
+
+        if (docHistory.value.length === 0) {
+            docHistory.value = [pathToAdd]
+            currentHistoryIndex.value = 0
+            return
+        }
+
+        if (pathToAdd !== docHistory.value[currentHistoryIndex.value]) {
+            docHistory.value = docHistory.value.slice(0, currentHistoryIndex.value + 1)
+            docHistory.value.push(pathToAdd)
+            currentHistoryIndex.value = docHistory.value.length - 1
+        }
+    }
+
+    const goBack = () => {
+        if (!canGoBack.value) return
+        currentHistoryIndex.value--
+        docStore.docPath = docHistory.value[currentHistoryIndex.value]
+    }
+
+    async function setDocPageFromResponse(path: string, response: {metadata?: DocMetadata, content: string}) {
+        docStore.pageMetadata = response.metadata
+        let content = response.content
+        if (!("canShare" in navigator)) {
+            content = content.replaceAll(/\s*web-share\s*/g, "")
+        }
+
+        content = removeMDXImports(content)
+
+        const {content: cleanedContent, removedComponents: _} = extractMultilineJSXComponents(content)
+
+        renderedDocPath.value = path.replace(/^\/?(.*?)\/?$/, "$1") || "docs"
+        markdownContent.value = replaceSelfClosingTagsWithOpenClose(cleanedContent)
+    }
+
+    async function fetchDefaultDocFromDocIdIfPossible() {
+        if(!isOnline.value) return
+
+        const docId = docStore.docId
+        try {
+            if(!docId) {
+                refreshPage()
+                return
+            }
+            const response = await docStore.fetchDocId(docId)
+            if (docId !== docStore.docId) return
+            if (response) {
+                await setDocPageFromResponse(response.metadata?.parsedUrl ?? "docs", response)
+                // Add the default page to history
+                addToHistory("docs")
+            } else {
+                refreshPage()
+            }
+        } catch {
+            if (docId === docStore.docId) refreshPage()
+        }
+    }
+
+    async function refreshPage(val?: string) {
+        const path = val || "docs"
+        const response = await docStore.fetchResource(path)
+        if (path !== (docStore.docPath || "docs")) return
+
+        await setDocPageFromResponse(path, response)
+        addToHistory(path)
+    }
+
+    onUnmounted(() => {
+        markdownContent.value = ""
+    })
+
+    watch([() => docStore.docId, () => docStore.docPath], async ([, val]) => {
+        if (!val?.length) {
+            fetchDefaultDocFromDocIdIfPossible()
+            return
+        }
+
+        addToHistory(val)
+        refreshPage(val)
+    }, {immediate: true})
+
+    const scrollableElement = computed<HTMLElement | null>(() => contextInfoRef.value?.contentRef ?? null)
+    useScrollMemory(ref("context-panel-docs"), scrollableElement)
+</script>
+
+<style scoped>
+
+    .back-button {
+        background: var(--ks-btn-secondary-bg-default);
+        border: 0.5px solid var(--ks-btn-secondary-border-default);
+        box-shadow: 0px 1px 4px 0px var(--ks-shadow-element);
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        color: var(--ks-text-primary);
+        border-radius: 8px;
+        width: 30px;
+        height: 32px;
+        transition: all 0.2s ease;
+        padding: 4px 8px;
+        flex-shrink: 0;
+
+        &:hover:not(.disabled),
+        &:focus:not(.disabled) {
+            background: var(--ks-bg-hover);
+            border-color: var(--ks-border-strong);
+            color: var(--ks-text-link);
+            outline: none;
+        }
+
+        &.disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+    }
+
+    .back-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: var(--ks-font-size-md);
+    }
+
+    .blank {
+        margin-left: 1rem;
+        color: var(--ks-text-dim);
+    }
+
+    .docs-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        margin-bottom: 1rem;
+    }
+
+    .offline-markdown {
+        margin: var(--ks-spacing-4);
+    }
+
+    .docs-toolbar {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 12px 28px 0;
+    }
+</style>

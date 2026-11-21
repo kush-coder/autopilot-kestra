@@ -1,0 +1,19 @@
+id: request-basicauth
+namespace: sanitychecks.core
+
+tasks:
+  - id: request
+    type: io.kestra.plugin.core.http.Request
+    uri: https://postman-echo.com/basic-auth
+    method: GET
+    options:
+       auth:
+         type: BASIC
+         username: postman
+         password: password
+
+  - id: assert
+    type: io.kestra.plugin.core.execution.Assert
+    errorMessage: "Invalid response code {{ outputs.request.code }}"
+    conditions:
+      - "{{ outputs.request.code == 200 }}"

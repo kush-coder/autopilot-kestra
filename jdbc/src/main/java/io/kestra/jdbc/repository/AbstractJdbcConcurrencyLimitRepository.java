@@ -1,0 +1,72 @@
+package io.kestra.jdbc.repository;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.jooq.Condition;
+import org.jooq.Field;
+import org.jooq.impl.DSL;
+
+import io.kestra.core.models.QueryFilter;
+import io.kestra.core.repositories.ConcurrencyLimitRepositoryInterface;
+import io.kestra.core.runners.ConcurrencyLimit;
+
+public class AbstractJdbcConcurrencyLimitRepository extends AbstractJdbcRepository implements ConcurrencyLimitRepositoryInterface {
+    protected io.kestra.jdbc.AbstractJdbcRepository<ConcurrencyLimit> jdbcRepository;
+
+    public AbstractJdbcConcurrencyLimitRepository(io.kestra.jdbc.AbstractJdbcRepository<ConcurrencyLimit> jdbcRepository) {
+        this.jdbcRepository = jdbcRepository;
+    }
+
+    @Override
+    public List<ConcurrencyLimit> find(String tenantId) {
+        return this.jdbcRepository
+            .getDslContextWrapper()
+            .transactionResult(configuration ->
+            {
+                var select = DSL
+                    .using(configuration)
+                    .select(field("value"))
+                    .from(this.jdbcRepository.getTable())
+                    .where(this.defaultFilter(tenantId));
+
+                return this.jdbcRepository.fetch(select);
+            });
+    }
+
+    protected Condition defaultFilter(String tenantId) {
+        return this.buildTenantCondition(tenantId).and(this.aclCondition(QueryFilter.Resource.CONCURRENCY_LIMIT));
+    }
+
+    @Override
+    public ConcurrencyLimit update(ConcurrencyLimit concurrencyLimit) {
+        Map<Field<Object>, Object> fields = this.jdbcRepository.persistFields(concurrencyLimit);
+        this.jdbcRepository.persist(concurrencyLimit, fields);
+
+        return concurrencyLimit;
+    }
+
+    @Override
+    public ConcurrencyLimit delete(ConcurrencyLimit concurrencyLimit) {
+        this.jdbcRepository.delete(concurrencyLimit);
+        return concurrencyLimit;
+    }
+
+    @Override
+    public Optional<ConcurrencyLimit> findById(String tenantId, String namespace, String flowId) {
+        return jdbcRepository
+            .getDslContextWrapper()
+            .transactionResult(configuration ->
+            {
+                var select = DSL
+                    .using(configuration)
+                    .select(field("value"))
+                    .from(this.jdbcRepository.getTable())
+                    .where(this.buildTenantCondition(tenantId))
+                    .and(field("namespace").eq(namespace))
+                    .and(field("flow_id").eq(flowId));
+                return this.jdbcRepository.fetchOne(select);
+            });
+    }
+}

@@ -1,0 +1,227 @@
+<template>
+    <KsTooltip
+        v-if="tooltip"
+        :content="tooltip"
+        v-bind="tooltipPlacement ? {placement: tooltipPlacement} : {}"
+    >
+        <ElButton
+            v-bind="({'aria-label': tooltip, ...filteredProps(), ...$attrs})"
+            :class="{'is-square': square, 'is-block': block, 'kel-button--toned': tone}"
+            @click="emit('click', $event)"
+            plain
+        >
+            <template v-if="$slots.default" #default>
+                <slot />
+            </template>
+            <template v-if="$slots.loading" #loading>
+                <slot name="loading" />
+            </template>
+            <template v-if="$slots.icon" #icon>
+                <slot name="icon" />
+            </template>
+        </ElButton>
+    </KsTooltip>
+    <ElButton
+        v-else
+        v-bind="({...filteredProps(), ...$attrs})"
+        :class="{'is-square': square, 'is-block': block, 'kel-button--toned': tone}"
+        @click="emit('click', $event)"
+        plain
+    >
+        <template v-if="$slots.default" #default>
+            <slot />
+        </template>
+        <template v-if="$slots.loading" #loading>
+            <slot name="loading" />
+        </template>
+        <template v-if="$slots.icon" #icon>
+            <slot name="icon" />
+        </template>
+    </ElButton>
+</template>
+
+<script lang="ts">
+    import type {ButtonProps, ButtonType, Placement} from "element-plus"
+    import type {RouteLocationRaw} from "vue-router"
+
+    export type KsButtonType = ButtonType
+
+    export interface KsButtonProps extends ButtonProps {
+        square?: boolean
+        block?: boolean
+        tooltip?: string
+        tooltipPlacement?: Placement
+        /** With `tag="a"`. */
+        href?: string
+        target?: string
+        rel?: string
+        /** With `:tag="RouterLink"` (or `tag="router-link"`). */
+        to?: RouteLocationRaw
+        replace?: boolean
+    }
+
+    interface KsButtonTone {
+        border: string
+        text: string
+    }
+
+    export const KS_BUTTON_TONES: Partial<Record<KsButtonType | "error", KsButtonTone>> = {
+        primary: {border: "var(--ks-btn-primary-bg-default)", text: "var(--ks-btn-primary-text)"},
+        success: {border: "var(--ks-border-success)", text: "var(--ks-text-success)"},
+        warning: {border: "var(--ks-border-warning)", text: "var(--ks-text-warning)"},
+        danger: {border: "var(--ks-border-error)", text: "var(--ks-text-error)"},
+        error: {border: "var(--ks-border-error)", text: "var(--ks-text-error)"},
+        info: {border: "var(--ks-border-info)", text: "var(--ks-text-info)"},
+    }
+</script>
+
+<script setup lang="ts">
+    import type {NativeAttributes} from "../../../utils/nativeAttributes"
+    import {computed, type ButtonHTMLAttributes, type AnchorHTMLAttributes} from "vue"
+
+    import {ElButton} from "element-plus"
+
+    import {useFilteredProps} from "../../../utils/filteredProps"
+    import KsTooltip from "../../Feedback/KsTooltip.vue"
+
+    defineOptions({inheritAttrs: false})
+
+    // Left undefined so a plain button does not render a replace="false" attribute.
+    const props = withDefaults(defineProps<KsButtonProps & /* @vue-ignore */ Omit<NativeAttributes<ButtonHTMLAttributes & Pick<AnchorHTMLAttributes, "download">>, keyof KsButtonProps>>(), {replace: undefined})
+
+    const emit = defineEmits<{
+        click: [evt: MouseEvent]
+    }>()
+
+    defineSlots<{
+        default?(): unknown
+        loading?(): unknown
+        icon?(): unknown
+    }>()
+
+    const filteredProps = useFilteredProps(props, ["tooltip", "tooltipPlacement", "square", "block"])
+
+    const tone = computed(() => (props.type ? KS_BUTTON_TONES[props.type] : undefined))
+</script>
+
+<style lang="scss">
+    @use '../../../assets/styles/el-ns';
+    @use 'element-plus/theme-chalk/src/button';
+</style>
+
+<style>
+    .kel-button + .kel-button {
+        margin-left: var(--ks-button-adjacent-margin, 12px);
+    }
+
+    .kel-button {
+        --kel-button-font-weight: 600;
+        --kel-button-border-color: var(--ks-btn-secondary-border-default);
+        --kel-button-disabled-text-color: var(--ks-text-inactive);
+
+        & [class*="kel-icon"] + span {
+            margin-left: var(--ks-spacing-2);
+        }
+
+        & > span {
+            width: var(--ks-button-content-width, auto);
+        }
+
+        &.kel-button--small {
+            border-radius: var(--kel-border-radius-small);
+        }
+
+        &.is-block {
+            display: flex;
+            width: 100%;
+        }
+
+        &.is-square {
+            aspect-ratio: 1;
+            padding-left: 0;
+            padding-right: 0;
+        }
+
+        /* Icon-only buttons centre the glyph. vue-material-design-icons nudges its SVG down by
+           0.125em (baseline alignment meant for inline-with-text use), which reads as off-centre
+           in a round/square button — neutralise it so the icon sits dead centre. */
+
+        &.is-circle,
+        &.is-square {
+            & .material-design-icon > .material-design-icon__svg {
+                bottom: 0;
+                left: 50%;
+                transform: translateX(-50%);
+            }
+        }
+
+        &.is-plain:not(.is-text) {
+            --kel-button-border-color: var(--ks-btn-secondary-border-default);
+            --kel-button-bg-color: var(--ks-btn-secondary-bg-default);
+            --kel-button-hover-text-color: var(--ks-text-primary);
+            --kel-button-hover-bg-color: var(--ks-btn-secondary-bg-hover);
+            --kel-button-hover-border-color: var(--ks-btn-secondary-border-hover);
+            --kel-button-active-text-color: var(--ks-text-primary);
+            --kel-button-active-bg-color: var(--ks-btn-secondary-bg-active);
+            --kel-button-active-border-color: var(--ks-btn-secondary-border-active);
+
+            &.kel-button--toned {
+                --kel-button-text-color: v-bind("tone?.text");
+                --kel-button-hover-text-color: v-bind("tone?.text");
+                --kel-button-hover-border-color: v-bind("tone?.border");
+                --kel-button-active-text-color: v-bind("tone?.text");
+                --kel-button-active-bg-color: var(--ks-btn-secondary-bg-active);
+                --kel-button-active-border-color: var(--ks-btn-secondary-border-default);
+            }
+
+            &.is-disabled {
+                background-color: var(--ks-btn-secondary-bg-inactive);
+                border-color: var(--ks-btn-secondary-border-inactive);
+                color: var(--ks-text-inactive);
+            }
+
+            &.kel-button--primary {
+                --kel-button-bg-color: var(--ks-btn-primary-bg-default);
+                --kel-button-border-color: var(--ks-btn-primary-bg-default);
+                --kel-button-hover-text-color: var(--ks-btn-primary-text);
+                --kel-button-hover-bg-color: var(--ks-btn-primary-bg-hover);
+                --kel-button-hover-border-color: var(--ks-btn-primary-bg-hover);
+                --kel-button-active-text-color: var(--ks-btn-primary-text);
+                --kel-button-active-bg-color: var(--ks-btn-primary-bg-active);
+                --kel-button-active-border-color: var(--ks-btn-primary-bg-active);
+            }
+        }
+
+        &.is-link {
+            --kel-button-text-color: var(--ks-button-link-color, var(--ks-text-secondary));
+            --kel-button-hover-link-text-color: var(--ks-text-primary);
+            --kel-button-active-color: var(--ks-text-primary);
+
+            &.kel-button--primary.is-plain:not(.is-text) {
+                --kel-button-text-color: var(--ks-text-link);
+                --kel-button-hover-link-text-color: var(--ks-text-link);
+                --kel-button-active-color: var(--ks-text-link);
+            }
+        }
+
+        &.is-text {
+            &:hover {
+                background-color: var(--ks-bg-hover);
+                /* Draw the hover ring with an inset shadow rather than a border: a border adds
+                   1px on each side and shifts surrounding layout, a shadow doesn't affect the box. */
+                box-shadow: inset 0 0 0 1px var(--ks-btn-secondary-border-hover);
+            }
+
+            &:active {
+                background-color: var(--ks-btn-secondary-bg-active);
+                box-shadow: none;
+            }
+        }
+
+        &.kel-button--primary:not(.is-text):not(.is-link).is-disabled {
+            background-color: var(--ks-btn-primary-bg-inactive);
+            border-color: var(--ks-btn-primary-bg-inactive);
+            color: var(--ks-text-inactive);
+        }
+    }
+</style>

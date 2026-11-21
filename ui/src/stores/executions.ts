@@ -1,0 +1,1117 @@
+import {computed, ref, watch, type Ref} from "vue"
+import {defineStore} from "pinia"
+import {useRoute, type LocationQuery} from "vue-router"
+import {CLUSTER_PREFIX, LOG_LEVELS, isDeepEqual, throttle, type LevelFilterValue} from "@kestra-io/design-system"
+import {
+    TaskRun,
+    useClient,
+    type Check,
+    type Execution as SDKExecution,
+    type ExecutionControllerApiValidateExecutionInputsResponseApiInputError as ApiInputError,
+    type ExecutionRepositoryInterfaceFlowFilter,
+    type FlowForExecution,
+    type Label,
+    type Level,
+    type LogEntry,
+    type PagedResultsApiLightExecution,
+    type QueryFilter,
+    type StateType,
+} from "@kestra-io/kestra-sdk"
+import * as ExecutionsAPI from "@kestra-io/kestra-sdk/executions"
+import * as LogsAPI from "@kestra-io/kestra-sdk/logs"
+import type {FlowGraph} from "@kestra-io/topology/vue-flow-utils"
+import {apiUrl} from "override/utils/route"
+import * as Utils from "../utils/utils"
+import {Optional} from "../utils/utils"
+import * as ExecutionUtils from "../utils/executionUtils"
+import {routeQueryToQueryFilters} from "../utils/queryFilters"
+import {scopedExecutionId} from "../utils/loopScope"
+import {executionLogsDownloadFilename} from "../utils/logs"
+import {InputType} from "../utils/inputs"
+import {executionLocation, isExampleFlow} from "../utils/analytics/activation"
+import {useCoreStore} from "./core"
+import {useApiStore} from "./api"
+import {handled, sseData} from "../utils/kestraHttp"
+import {toFlowGraph} from "../utils/flowGraph"
+import {latestRequest} from "../utils/latestRequest"
+
+export type {Label, StateHistory as Histories} from "@kestra-io/kestra-sdk"
+
+export type {Check} from "@kestra-io/kestra-sdk"
+
+// `path` is added to `ApiInputError` on this branch, and the generated SDK only picks it up once `develop` regenerates it.
+export type InputError = ApiInputError & {path?: string}
+
+export type ReviewDecision = "APPROVE" | "DENY"
+
+export interface ValidationResponse {
+    checks?: Check[];
+    inputs: Array<{
+        enabled: boolean;
+        input: InputMetaData;
+        errors?: InputError[];
+        value?: unknown;
+        isDefault?: boolean;
+    }>;
+}
+
+export interface ValidationEventPayload {
+    formData: FormData | undefined;
+    inputsMetaData: InputMetaData[];
+    callback: (response: ValidationResponse) => void;
+}
+
+export type ValueOptionLike = string | {label: string; value: string};
+
+export interface InputMetaData {
+    id: string;
+    type: InputType
+    displayName?: string;
+    description?: string;
+    descriptionDisplayMode?: "TEXT" | "TOOLTIP";
+    required?: boolean;
+    defaults?: unknown;
+    value?: unknown;
+    values?: ValueOptionLike[];
+    options?: ValueOptionLike[];
+    errors?: InputError[];
+    isDefault?: boolean;
+    isRadio?: boolean;
+    allowCustomValue?: boolean;
+    min?: number;
+    max?: number;
+    after?: string;
+    before?: string;
+    allowedFileExtensions?: string[];
+    accept?: string;
+    prefill?: unknown;
+    /** Only on the raw flow inputs: the validate response strips it, keeping `dependsOn` at most. */
+    expression?: string;
+    dependsOn?: unknown;
+    /** Set on a FORM input only: the children it groups, mirroring the backend `FormInput.inputs`. */
+    inputs?: InputMetaData[];
+    /** Set on a TABLE input only: one input definition per column, each evaluated once per row. */
+    columns?: InputMetaData[];
+    minRows?: number;
+    maxRows?: number;
+    filters?: TableFilter[];
+    allowRowDuplication?: boolean;
+    /** The indexes of the rows of `defaults` matching the rendered filters, set by the server. */
+    matchingDefaults?: number[];
+    /** Set on an ASSET input only: the filters of the assets that can be picked, rendered by the server. */
+    assetType?: string;
+    assetId?: string;
+    namespace?: string;
+    metadata?: Record<string, unknown>;
+    multiple?: boolean;
+    status?: string;
+}
+
+export interface TableFilter {
+    column: string;
+    operation: "EQUALS" | "NOT_EQUALS" | "IN" | "NOT_IN" | "CONTAINS";
+    value: unknown;
+}
+
+/** Mirrors the backend `FilePreview`: `content` is renderer-specific (text, rows, base64, ...). */
+export interface FilePreview {
+    extension?: string;
+    type?: "TEXT" | "LIST" | "IMAGE" | "MARKDOWN" | "PDF";
+    content?: unknown;
+    truncated?: boolean;
+}
+
+export type Execution = Omit<Optional<SDKExecution, "deleted" | "metadata" | "originalId">, "taskRunList"> & {
+    tenantId?: string;
+    taskRunList?: Optional<TaskRun, "namespace" | "executionId" | "flowId">[];
+    inputs?: Record<string, unknown>;
+    variables?: Record<string, unknown>;
+}
+
+/** A route query whose `filters[...]` keys reach the backend as filters, left open because the
+ *  bulk-action dispatcher merges the action's own options into the same bag (see `Executions.vue`). */
+type FilterQuery = Record<string, unknown>
+
+/** Route query of the executions list plus the paging and commit options `findExecutions` reads. */
+type ExecutionSearchOptions = FilterQuery & {
+    page?: number;
+    size?: number;
+    sort?: string;
+    /** `false` returns the page without replacing the store's `executions`/`total`. */
+    commit?: boolean;
+    onlyTotal?: boolean;
+}
+
+type DeleteExecutionOptions = {
+    includeNonTerminated?: boolean;
+    deleteLogs?: boolean;
+    deleteMetrics?: boolean;
+    deleteStorage?: boolean;
+}
+
+type GraphOptions = {
+    id: string;
+    /** `subflows` lists the subflow paths whose own graph is expanded inline. */
+    params?: { subflows?: string[] };
+}
+
+type FlowGraphNode = FlowGraph["nodes"][number]
+
+/** The generated downloads are typed as a `Blob` whatever `parseAs` asks for, while `parseAs: "text"` yields the string itself. */
+async function asText(body: Blob | string): Promise<string> {
+    return typeof body === "string" ? body : body.text()
+}
+
+/** Renders an ION preview of scalar rows as text, a workaround for https://github.com/kestra-io/plugin-aws/issues/456. */
+export function normalizeFilePreview(data: FilePreview): FilePreview {
+    const rows = data?.content
+    if (data?.extension !== "ion" || !Array.isArray(rows)) {
+        return data
+    }
+
+    const notObjects = rows.some((row: unknown) => typeof row !== "object")
+
+    if (!notObjects) {
+        return data
+    }
+
+    const content = rows.length === 1 ? rows[0] : rows.join("\n")
+    return {...data, type: "TEXT", content}
+}
+
+/** The level filter the backend applies to the logs it returns, for logs the store already holds. */
+function matchesLevelFilter(level: Level | undefined, filter: LevelFilterValue | undefined): boolean {
+    if (!filter || !level) return true
+    const severity = (value: string) => (LOG_LEVELS as readonly string[]).indexOf(value)
+    switch (filter.direction) {
+    case "min":
+        return severity(level) <= severity(filter.value)
+    case "max":
+        return severity(level) >= severity(filter.value)
+    case "in":
+        return filter.value.split(",").includes(level)
+    case "not_in":
+        return !filter.value.split(",").includes(level)
+    }
+}
+
+const FOLLOW_RETRY_DELAY_MS = 1000
+const FOLLOW_MAX_RETRY_DELAY_MS = 30_000
+const FOLLOW_MAX_RECONNECTS = 6
+const FOLLOW_RECONNECT_WINDOW_MS = 120_000
+/** 2.5 server heartbeats (ExecutionController.FOLLOW_HEARTBEAT_INTERVAL), so one late heartbeat is not a stall. */
+const FOLLOW_IDLE_TIMEOUT_MS = 75_000
+
+export const useExecutionsStore = defineStore("executions", () => {
+    const executions: Ref<Execution[] | undefined> = ref(undefined)
+    const execution: Ref<Execution | undefined> = ref(undefined)
+    const total = ref<number>(0)
+    const logs = ref<LogEntry[]>([])
+    /** Task runs a playground replay reused rather than ran, with the logs they carry over, keyed by the replay's id. */
+    const reusedTaskRuns = ref<Record<string, {taskRunIds: string[]; logs: LogEntry[]}>>({})
+    const subflowsExecutions: Ref<Record<string, Execution>> = ref({})
+    const scopedIterations: Ref<Record<string, Execution>> = ref({})
+    /** Lifecycle-step progress plugins report mid-run, read off the follow-logs stream.
+     *  Never reset across navigations: a taskRunId is globally unique. */
+    const progressEvents = ref<{taskId: string; taskRunId: string; step: string; timestamp: string}[]>([])
+    const flow: Ref<FlowForExecution | undefined> = ref(undefined)
+    const flowGraph = ref<FlowGraph | undefined>(undefined)
+    const taskRunSelections = ref<Map<string, string>>(new Map())
+    const namespaces = ref<string[]>([])
+    const flowsExecutable: Ref<FlowForExecution[]> = ref([])
+
+    watch(execution, (newExecution) => {
+        if(!newExecution){
+            flowGraph.value = undefined
+            flow.value = undefined
+            scopedIterations.value = {}
+            taskRunSelections.value.clear()
+        }
+    })
+
+    const coreStore = useCoreStore()
+    const axios = useClient()
+    const route = useRoute()
+
+    const restartExecution = (options: { executionId: string }): Promise<Execution> => {
+        return ExecutionsAPI.restartExecution({executionId: options.executionId})
+    }
+
+    const bulkRestartExecution = (options: { executionsId: string[] }) => {
+        return ExecutionsAPI.restartExecutionsByIds({body: options.executionsId})
+    }
+
+    const queryRestartExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.restartExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
+    }
+
+    const bulkResumeExecution = (options: { executionsId: string[] }) => {
+        return ExecutionsAPI.resumeExecutionsByIds({body: options.executionsId})
+    }
+
+    const queryResumeExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.resumeExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
+    }
+
+    const bulkReplayExecution = (options: { executionsId: string[]; latestRevision?: boolean }) => {
+        return ExecutionsAPI.replayExecutionsByIds({body: options.executionsId, latestRevision: options.latestRevision})
+    }
+
+    const bulkChangeExecutionStatus = (options: { executionsId: string[]; newStatus: StateType }) => {
+        return ExecutionsAPI.updateExecutionsStatusByIds({body: options.executionsId, newStatus: options.newStatus})
+    }
+
+    const queryReplayExecution = (options: FilterQuery & { latestRevision?: boolean }) => {
+        return ExecutionsAPI.replayExecutionsByQuery({filters: routeQueryToQueryFilters(options), latestRevision: options.latestRevision})
+    }
+
+    const queryChangeExecutionStatus = (options: FilterQuery & { newStatus: StateType }) => {
+        return ExecutionsAPI.updateExecutionsStatusByQuery({filters: routeQueryToQueryFilters(options), newStatus: options.newStatus})
+    }
+
+    const replayExecution = (options: { executionId: string; taskRunId?: string; revision?: number, breakpoints?: string[] }): Promise<Execution> => {
+        return ExecutionsAPI.replayExecution({
+            executionId: options.executionId,
+            taskRunId: options.taskRunId,
+            revision: options.revision,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+        })
+    }
+
+    const validateReplay = (options: { executionId: string; taskRunId?: string; revision?: number }) => {
+        return ExecutionsAPI.validateReplayExecution(options)
+    }
+
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const replayExecutionWithInputs = (options: { executionId: string; taskRunId?: string; revision?: number, breakpoints?: string[], formData?: FormData }) => {
+        return axios.post<Execution>(
+            `${apiUrl()}/executions/${options.executionId}/actions/replay-with-inputs`,
+            options.formData,
+            {
+                params: {
+                    taskRunId: options.taskRunId,
+                    revision: options.revision,
+                    breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+                },
+            }).then(response => response.data)
+    }
+
+    const changeExecutionStatus = (options: { executionId: string; state: string }): Promise<Execution> => {
+        return ExecutionsAPI.updateExecutionStatus({executionId: options.executionId, status: options.state as Parameters<typeof ExecutionsAPI.updateExecutionStatus>[0]["status"]})
+    }
+
+    const changeStatus = (options: { executionId: string; taskRunId?: string; state: string }): Promise<Execution> => {
+        return ExecutionsAPI.updateTaskRunState({
+            executionId: options.executionId,
+            taskRunId: options.taskRunId!,
+            state: options.state as Parameters<typeof ExecutionsAPI.updateTaskRunState>[0]["state"],
+        })
+    }
+
+    const interrupt = (options: { executionId: string; taskRunId: string; state: string }) => {
+        return axios.post(`${apiUrl()}/executions/${options.executionId}/actions/interrupt`, {
+            taskRunId: options.taskRunId,
+            state: options.state,
+        })
+    }
+
+    const waitForStateChange = async (source: Execution) => {
+        const updated = await ExecutionUtils.waitForState(axios, source) as Execution
+        execution.value = updated
+        return updated
+    }
+
+    const kill = (options: { id: string; isOnKillCascade?: boolean }): Promise<Execution> => {
+        return ExecutionsAPI.killExecution({executionId: options.id, isOnKillCascade: options.isOnKillCascade})
+    }
+
+    const bulkKill = (options: { executionsId: string[] }) => {
+        return ExecutionsAPI.killExecutionsByIds({body: options.executionsId})
+    }
+
+    const queryKill = (options: FilterQuery) => {
+        return ExecutionsAPI.killExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
+    }
+
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const resume = (options: { id: string; formData?: FormData }) => {
+        return axios.post<Execution>(`${apiUrl()}/executions/${options.id}/actions/resume`, Utils.toFormData(options.formData ?? {}), {
+            timeout: 60 * 60 * 1000,
+        }).then(response => response.data)
+    }
+
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const validateResume = (options: { id: string; formData?: FormData }) => {
+        return axios.post<ValidationResponse>(`${apiUrl()}/executions/${options.id}/actions/resume/validate`, Utils.toFormData(options.formData ?? {}), {
+            timeout: 60 * 60 * 1000,
+        }).then(response => response.data)
+    }
+
+    // Stays on raw axios: multipart form-data body, and the review endpoints are not in the generated SDK yet.
+    const review = (options: { id: string; taskRunId: string; decision: ReviewDecision; formData?: FormData }) => {
+        return axios.post<Execution>(`${apiUrl()}/executions/${options.id}/actions/review`, Utils.toFormData(options.formData ?? {}), {
+            params: {taskRunId: options.taskRunId, decision: options.decision},
+            timeout: 60 * 60 * 1000,
+        }).then(response => response.data)
+    }
+
+    const validateReview = (options: { id: string; taskRunId: string; decision: ReviewDecision; formData?: FormData }) => {
+        return axios.post<ValidationResponse>(`${apiUrl()}/executions/${options.id}/actions/review/validate`, Utils.toFormData(options.formData ?? {}), {
+            params: {taskRunId: options.taskRunId, decision: options.decision},
+            timeout: 60 * 60 * 1000,
+        }).then(response => response.data)
+    }
+
+    const reviewAllowed = (options: { id: string; taskRunId: string }) => {
+        return axios.get<{allowed: boolean}>(`${apiUrl()}/executions/${options.id}/actions/review/allowed`, {
+            params: {taskRunId: options.taskRunId},
+        }).then(response => response.data.allowed)
+    }
+
+    const reviewAllowedRequests = new Map<string, Promise<boolean>>()
+
+    const isReviewAllowed = (options: { id: string; taskRunId: string }) => {
+        const key = `${options.id}/${options.taskRunId}`
+        let request = reviewAllowedRequests.get(key)
+        if (request === undefined) {
+            request = reviewAllowed(options).catch((e: unknown) => {
+                handled(e)
+                reviewAllowedRequests.delete(key)
+                return false
+            })
+            reviewAllowedRequests.set(key, request)
+        }
+        return request
+    }
+
+    const cancelApproval = (options: { id: string; taskRunId: string }) => {
+        return axios.post<Execution>(`${apiUrl()}/executions/${options.id}/actions/cancel-approval`, undefined, {
+            params: {taskRunId: options.taskRunId},
+        }).then(response => response.data)
+    }
+
+    const resumeFromBreakpoint = (options: { id: string; breakpoints?: string[] }): Promise<Execution> => {
+        return ExecutionsAPI.resumeExecutionFromBreakpoint({
+            executionId: options.id,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+        })
+    }
+
+    const pause = (options: { id: string }): Promise<Execution> => {
+        return ExecutionsAPI.pauseExecution({executionId: options.id})
+    }
+
+    const bulkPauseExecution = (options: { executionsId: string[] }) => {
+        return ExecutionsAPI.pauseExecutionsByIds({body: options.executionsId})
+    }
+
+    const queryPauseExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.pauseExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
+    }
+
+    const startExecutionLoad = latestRequest()
+
+    /** A superseded load is dropped, as in `stores/logs.ts`, and cancels the pending throttled update so a
+     *  trailing event from the previous execution's stream cannot land on top of this one. */
+    const loadExecution = (options: { id: string }) => {
+        const isLatestLoad = startExecutionLoad()
+        return ExecutionsAPI.execution({executionId: options.id}).then(data => {
+            if (!isLatestLoad()) return data
+
+            throttledExecutionUpdate.cancel()
+            execution.value = data
+            return execution.value
+        })
+    }
+
+    function toExecutionSearchParams(options: ExecutionSearchOptions) {
+        return {
+            page: options.page,
+            size: options.size,
+            sort: options.sort ? [options.sort] : undefined,
+            filters: routeQueryToQueryFilters(options),
+        }
+    }
+
+    /** Sequence number for committing searches: a response that is no longer the newest may
+     * resolve after it and must not overwrite the list (same rule as `stores/logs.ts`). */
+    const startExecutionsSearch = latestRequest()
+
+    /** With `onlyTotal`, resolves to the number of matches instead of the page of results. */
+    function findExecutions(options: ExecutionSearchOptions & { onlyTotal: true }): Promise<number>
+    function findExecutions(options: ExecutionSearchOptions): Promise<PagedResultsApiLightExecution>
+    function findExecutions(options: ExecutionSearchOptions): Promise<PagedResultsApiLightExecution | number> {
+        const isLatestSearch = options.commit === false ? undefined : startExecutionsSearch()
+        return ExecutionsAPI.searchExecutions(toExecutionSearchParams(options)).then(response => {
+            if (isLatestSearch?.()) {
+                executions.value = response.results
+                total.value = response.total ?? 0
+            }
+
+            if (options.onlyTotal) {
+                return response.total
+            }
+
+            return response
+        })
+    }
+
+    const findDistinctFieldValues = async (options: {
+        field: string;
+        filters?: LocationQuery;
+        size?: number;
+    }): Promise<string[]> => {
+        return ExecutionsAPI.findDistinctFieldValues({
+            field: options.field as Parameters<typeof ExecutionsAPI.findDistinctFieldValues>[0]["field"],
+            filters: options.filters ? routeQueryToQueryFilters(options.filters) : undefined,
+            size: options.size ?? 100,
+        })
+    }
+
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const validateExecution = (options: { namespace: string; id: string; formData?: FormData; labels?: string[]; scheduleDate?: string }) => {
+        return axios.post<ValidationResponse>(`${apiUrl()}/executions/${options.namespace}/${options.id}/validate`, Utils.toFormData(options.formData ?? {}), {
+            timeout: 60 * 60 * 1000,
+            params: {
+                labels: options.labels ?? [],
+                scheduleDate: options.scheduleDate,
+            },
+        }).then(response => response.data)
+    }
+
+    /** The SDK types the multipart body as `Blob[]`, but its serializer runs `Object.entries(body)`, so the input values
+     *  object is sent as is. Never set Content-Type: the browser adds the boundary. */
+    const triggerExecution = (options: {
+        namespace: string;
+        id: string;
+        formData?: Record<string, unknown>;
+        kind: "PLAYGROUND" | "NORMAL"
+        breakpoints?: string[];
+        labels?: string[];
+        scheduleDate?: string,
+        revision?: number,
+    }) => {
+        return ExecutionsAPI.createExecution({
+            namespace: options.namespace,
+            id: options.id,
+            // The endpoint reads the inputs as multipart parts keyed by input id, which the generated body type (an array of blobs) cannot express.
+            body: options.formData as unknown as Parameters<typeof ExecutionsAPI.createExecution>[0]["body"],
+            labels: options.labels ?? [],
+            scheduleDate: options.scheduleDate,
+            kind: options.kind,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+            revision: options.revision,
+        }, {timeout: 60 * 60 * 1000}).then(exec => {
+            useApiStore().posthogEvents({
+                type: "FLOW_EXECUTION",
+                action: "executed",
+                execution_id: exec.id,
+                namespace: exec.namespace,
+                flow_id: exec.flowId,
+                location: executionLocation(route.name?.toString(), options.kind),
+                is_example: isExampleFlow(exec.namespace),
+                revision: exec.flowRevision,
+            })
+
+            return exec
+        })
+    }
+
+    const deleteExecution = (options: { id: string; deleteLogs?: boolean; deleteMetrics?: boolean; deleteStorage?: boolean }) => {
+        return ExecutionsAPI.deleteExecution({
+            executionId: options.id,
+            deleteLogs: options.deleteLogs,
+            deleteMetrics: options.deleteMetrics,
+            deleteStorage: options.deleteStorage,
+        }).then(() => {
+            execution.value = undefined
+        })
+    }
+
+    const bulkDeleteExecution = (options: { executionsId: string[] } & DeleteExecutionOptions) => {
+        const {executionsId, ...rest} = options
+        return ExecutionsAPI.deleteExecutionsByIds({body: executionsId, ...rest, async: true})
+    }
+
+    const queryDeleteExecution = (options: FilterQuery & DeleteExecutionOptions) => {
+        return ExecutionsAPI.deleteExecutionsByQuery({
+            filters: routeQueryToQueryFilters(options),
+            includeNonTerminated: options.includeNonTerminated,
+            deleteLogs: options.deleteLogs,
+            deleteMetrics: options.deleteMetrics,
+            deleteStorage: options.deleteStorage,
+            async: true,
+        })
+    }
+
+    const executionSubscription = ref<{ close: () => void } | undefined>(undefined)
+
+    function closeSSE() {
+        executionSubscription.value?.close()
+        executionSubscription.value = undefined
+    }
+
+    const throttledExecutionUpdate = throttle((parsedExecution: Execution) => {
+        const flowValue = flow.value
+        execution.value = parsedExecution
+        const currentExecution = execution.value
+
+        if ((!flowValue ||
+            parsedExecution.flowId !== flowValue.id ||
+            parsedExecution.namespace !== flowValue.namespace ||
+            parsedExecution.flowRevision !== flowValue.revision)
+        ) {
+            loadFlowForExecutionByExecutionId(
+                {
+                    id: parsedExecution.id,
+                    revision: route.query.revision?.toString(),
+                },
+            ).then(() => {
+                if (execution.value === currentExecution) {
+                    execution.value = parsedExecution
+                }
+            })
+        }
+    }, 500)
+
+    /** Follows an execution through the SDK stream, skipping the id-only start and heartbeat events. `onEnd` fires once,
+     *  and `onError` too when the stream stops before its "end" event and cannot be resumed (a 404 or a lost connection). */
+    function subscribeToExecution(
+        executionId: string,
+        handlers: {
+            onExecution: (execution: Execution) => void;
+            onError?: () => void;
+            onEnd?: () => void;
+        },
+    ): { close: () => void } {
+        let connection: AbortController | undefined
+        let retryTimer: ReturnType<typeof setTimeout> | undefined
+        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        let closed = false
+        let finished = false
+        let receivedExecution = false
+        let consecutiveFailures = 0
+        const reconnects: number[] = []
+
+        const finish = (errored: boolean) => {
+            if (finished || closed) return
+            finished = true
+            if (errored) handlers.onError?.()
+            handlers.onEnd?.()
+        }
+
+        const close = () => {
+            if (closed) return
+            closed = true
+            clearTimeout(retryTimer)
+            clearTimeout(idleTimer)
+            connection?.abort()
+        }
+
+        /** Unbounded reconnects leaked off-heap Netty buffers (kestra-io/kestra#16982), hence the cap per time window. */
+        const reconnect = () => {
+            const now = Date.now()
+            while (reconnects.length > 0 && now - reconnects[0] > FOLLOW_RECONNECT_WINDOW_MS) reconnects.shift()
+            if (reconnects.length >= FOLLOW_MAX_RECONNECTS) {
+                finish(true)
+                return
+            }
+            reconnects.push(now)
+            const delay = Math.min(FOLLOW_RETRY_DELAY_MS * 2 ** consecutiveFailures, FOLLOW_MAX_RETRY_DELAY_MS)
+            consecutiveFailures++
+            retryTimer = setTimeout(connect, delay)
+        }
+
+        const follow = async (controller: AbortController) => {
+            let receivedEnd = false
+            const armIdleTimeout = () => {
+                clearTimeout(idleTimer)
+                idleTimer = setTimeout(() => controller.abort(), FOLLOW_IDLE_TIMEOUT_MS)
+            }
+            armIdleTimeout()
+            const {stream} = await ExecutionsAPI.followExecution(
+                {executionId},
+                {
+                    signal: controller.signal,
+                    sseMaxRetryAttempts: 1,
+                    onSseEvent: (event: { id?: string }) => {
+                        armIdleTimeout()
+                        if (event.id === "end") receivedEnd = true
+                    },
+                },
+            )
+            for await (const executionEvent of sseData(stream)) {
+                if (closed) break
+                if (!executionEvent.state) continue
+                receivedExecution = true
+                handlers.onExecution(executionEvent)
+            }
+            return receivedEnd
+        }
+
+        const connect = async () => {
+            connection = new AbortController()
+            const connectedAt = Date.now()
+            const receivedEnd = await follow(connection).catch(() => false)
+            clearTimeout(idleTimer)
+            // the server sends progress on every connect, so only a connection that held resets the backoff
+            if (Date.now() - connectedAt > FOLLOW_MAX_RETRY_DELAY_MS) consecutiveFailures = 0
+            if (closed) return
+            if (receivedEnd) finish(false)
+            // no execution ever received is most likely a 404, which a retry cannot fix
+            else if (!receivedExecution) finish(true)
+            else reconnect()
+        }
+
+        connect()
+
+        return {close}
+    }
+
+    /** Keeps an execution the route guard already loaded, so the page does not fall back to its loading state. */
+    const followExecution = (options: { id: string }, translate: (itn: string) => string) => {
+        if (execution.value?.id !== options.id) {
+            execution.value = undefined
+        }
+        closeSSE()
+
+        executionSubscription.value = subscribeToExecution(options.id, {
+            onExecution: (parsedExecution) => throttledExecutionUpdate(parsedExecution),
+            /** The stream only fails with a 404, so no execution yet means not found, otherwise the connection was lost. */
+            onError: () => {
+                coreStore.message = !execution.value
+                    ? {
+                        variant: "error",
+                        title: translate("error"),
+                        content: translate("errors.404.flow or execution"),
+                    }
+                    : {
+                        variant: "error",
+                        title: translate("something_went_wrong.connection_lost.title"),
+                        content: translate("something_went_wrong.connection_lost.message"),
+                    }
+            },
+            onEnd: () => {
+                throttledExecutionUpdate.flush()
+                closeSSE()
+            },
+        })
+    }
+
+    function followExecutionDependencies(options: { id: string; expandAll?: boolean }) {
+        return new EventSource(`${apiUrl()}/executions/${options.id}/follow-dependencies${options.expandAll ? "?expandAll=true" : ""}`, {withCredentials: true})
+    }
+
+    const followLogs = (options: { id: string; params?: FilterQuery }) => {
+        const search = new URLSearchParams()
+        Object.entries(options.params ?? {}).forEach(([key, value]) => {
+            if (value === undefined || value === null || value === "") return
+            if (Array.isArray(value)) {
+                value.forEach(item => search.append(key, String(item)))
+            } else {
+                search.append(key, String(value))
+            }
+        })
+        const query = search.toString()
+        return Promise.resolve(new EventSource(`${apiUrl()}/logs/${options.id}/follow${query ? `?${query}` : ""}`, {withCredentials: true}))
+    }
+
+    // `page` and `size` turn on the endpoint's optional pagination; without them every matching log is returned.
+    const loadLogs = (options: { executionId: string; filters?: QueryFilter[]; store?: boolean; page?: number; size?: number; sort?: string[] }) => {
+        return LogsAPI.listLogsFromExecution({
+            executionId: options.executionId,
+            filters: options.filters ?? [],
+            ...(options.page !== undefined ? {page: options.page} : {}),
+            ...(options.size !== undefined ? {size: options.size} : {}),
+            ...(options.sort !== undefined ? {sort: options.sort} : {}),
+        }).then(data => {
+            if (options.store === false) {
+                return data
+            }
+            logs.value = data
+            return data
+        })
+    }
+
+    const downloadLogs = (options: { executionId: string; filters?: QueryFilter[] }) => {
+        return LogsAPI.downloadLogsFromExecution({
+            executionId: options.executionId, 
+            filters: options.filters ?? [],
+        }) 
+    }
+
+    const downloadLogsFile = (options: { executionId: string; filters?: QueryFilter[] }) => {
+        return downloadLogs(options).then(text => {
+            Utils.downloadBlob(new Blob([text]), executionLogsDownloadFilename(options.executionId, new Date()))
+        })
+    }
+
+    const deleteLogs = (options: { executionId: string; params?: { minLevel?: Level; taskRunId?: string; taskId?: string; attempt?: number } }) => {
+        return LogsAPI.deleteLogsFromExecution({executionId: options.executionId, ...options.params})
+    }
+
+    const filePreview = (options: { executionId: string; path: string; maxRows?: number; encoding?: string }) => {
+        return ExecutionsAPI.previewFileFromExecution(options).then(data => normalizeFilePreview({...data} as FilePreview))
+    }
+
+    /** The whole file as text, unlike `filePreview` which caps rows and bytes, so an HTML preview gets a valid document. */
+    const fileContent = (options: { executionId: string; path: string }): Promise<string> => {
+        return ExecutionsAPI.downloadFileFromExecution(options, {parseAs: "text"}).then(asText)
+    }
+
+    const setLabels = (options: { executionId: string; labels: Label[] }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecution({executionId: options.executionId, body: options.labels})
+    }
+
+    const querySetLabels = (options: { data: Label[]; params: FilterQuery }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecutionsByQuery({filters: routeQueryToQueryFilters(options.params), body: options.data})
+    }
+
+    const bulkSetLabels = (options: { executionsId: string[]; executionLabels: Label[] }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecutionsByIds(options)
+    }
+
+    const unqueue = (options: { id: string; state: string }): Promise<Execution> => {
+        return ExecutionsAPI.unqueueExecution({executionId: options.id, state: options.state as Parameters<typeof ExecutionsAPI.unqueueExecution>[0]["state"]})
+    }
+
+    const bulkUnqueueExecution = (options: { executionsId: string[]; newStatus: StateType }) => {
+        return ExecutionsAPI.unqueueExecutionsByIds({body: options.executionsId, state: options.newStatus})
+    }
+
+    const queryUnqueueExecution = (options: FilterQuery & { newStatus: StateType }) => {
+        return ExecutionsAPI.unqueueExecutionsByQuery({
+            filters: routeQueryToQueryFilters(options),
+            newState: options.newStatus,
+        })
+    }
+
+    const forceRun = (options: { id: string }): Promise<Execution> => {
+        return ExecutionsAPI.forceRunExecution({executionId: options.id})
+    }
+
+    const bulkForceRunExecution = (options: { executionsId: string[] }) => {
+        return ExecutionsAPI.forceRunByIds({body: options.executionsId})
+    }
+
+    const queryForceRunExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.forceRunExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
+    }
+
+    const loadFlowForExecution = (options: { namespace: string; flowId: string; revision?: number, store: boolean }) => {
+        return ExecutionsAPI.flowFromExecution({namespace: options.namespace, flowId: options.flowId, revision: options.revision})
+            .then(data => {
+                if (options.store) {
+                    flow.value = data
+                }
+                return data
+            })
+    }
+
+    const loadFlowForExecutionByExecutionId = (options: { id: string, revision?: string }) => {
+        return ExecutionsAPI.flowFromExecutionById({executionId: options.id})
+            .then(data => {
+                flow.value = data
+                return data
+            })
+    }
+
+    const fetchGraph = (options: GraphOptions): Promise<FlowGraph> => {
+        return ExecutionsAPI.executionFlowGraph({executionId: options.id, subflows: options.params?.subflows}, {withCredentials: true}).then(toFlowGraph)
+    }
+
+    function loadGraph(options: GraphOptions) {
+        return fetchGraph(options).then(graph => {
+            flowGraph.value = Object.assign({}, graph)
+        })
+    }
+
+    const ranTaskIds = computed<Record<string, string[]>>((previous) => {
+        const next: Record<string, string[]> = {}
+        for (const exec of [execution.value, ...Object.values(subflowsExecutions.value), ...Object.values(scopedIterations.value)]) {
+            if (exec?.id) next[exec.id] = [...new Set((exec.taskRunList ?? []).map(taskRun => taskRun.taskId))].sort()
+        }
+        return previous && isDeepEqual(previous, next) ? previous : next
+    })
+
+    function isUnused(nodeByUid: Record<string, FlowGraphNode>, nodeUid: string): boolean {
+        const nodeToCheck = nodeByUid[nodeUid]
+
+        if(!nodeToCheck) {
+            return false
+        }
+
+        if(!nodeToCheck.task) {
+            const splitUid = nodeToCheck.uid.split(".")
+            splitUid.pop()
+            return isUnused(nodeByUid, splitUid.join("."))
+        }
+
+        if (!nodeToCheck.executionId) {
+            return true
+        }
+
+        return !ranTaskIds.value[nodeToCheck.executionId]?.some(taskId => taskId === nodeToCheck.task?.id)
+    }
+
+    const subflowPathsOf = (graph: FlowGraph) => graph.clusters
+        ?.map(c => c.cluster)
+        ?.filter(cluster => cluster.type.endsWith("SubflowGraphCluster"))
+        ?.map(cluster => cluster.uid.replace(CLUSTER_PREFIX, ""))
+        ?? []
+
+    const insideSubflow = (subflowPaths: string[], nodeUid: string) => subflowPaths.some(subflowPath => nodeUid.startsWith(subflowPath + "."))
+
+    /** Visits nodes shallowest first, so a parent is in `nodeByUid` before a child checks whether it is unused. */
+    const loadAugmentedGraph = async (options: GraphOptions) => {
+        const params = options.params ? options.params : {}
+        const graph = await fetchGraph({id: options.id, params})
+
+        const subflowPaths = subflowPathsOf(graph)
+        const nodeByUid: Record<string, FlowGraphNode> = {}
+
+        graph.nodes
+            .sort((a, b) => a.uid.length - b.uid.length)
+            .forEach(node => {
+                nodeByUid[node.uid] = node
+
+                const parentSubflow = subflowPaths.filter(subflowPath => node.uid.startsWith(subflowPath + "."))
+                    .sort((a, b) => b.length - a.length)?.[0]
+
+                if(parentSubflow) {
+                    if(parentSubflow in subflowsExecutions.value) {
+                        node.executionId = subflowsExecutions.value[parentSubflow]?.id
+                    }
+
+                    return
+                }
+
+                node.executionId = options.id
+
+                if(!node.task && isUnused(nodeByUid, node.uid)) {
+                    node.unused = true
+                }
+            })
+
+        graph.edges
+            .filter(edge => {
+                return isUnused(nodeByUid, edge.target) || isUnused(nodeByUid, edge.source)
+            }).forEach(edge => edge.unused = true)
+
+        flowGraph.value = Object.assign({}, graph)
+
+        return graph
+    }
+
+    const scopedIterationIds = computed<Record<string, {id: string}>>((previous) => {
+        const next = Object.fromEntries(
+            Object.entries(scopedIterations.value).flatMap(([lane, iteration]) => iteration.id ? [[lane, {id: iteration.id}]] : []),
+        )
+        return previous && isDeepEqual(previous, next) ? previous : next
+    })
+
+    const scopedFlowGraph = computed<FlowGraph | undefined>(() => {
+        const graph = flowGraph.value
+        if (!graph || !Object.keys(scopedIterationIds.value).length) return graph
+
+        const subflowPaths = subflowPathsOf(graph)
+        const nodes = graph.nodes.map(node => {
+            const executionId = scopedExecutionId(node.uid, scopedIterationIds.value, subflowPaths)
+            return executionId ? {...node, executionId} : node
+        })
+        const nodeByUid: Record<string, FlowGraphNode> = Object.fromEntries(nodes.map(node => [node.uid, node]))
+
+        return {
+            ...graph,
+            nodes: nodes.map(node => insideSubflow(subflowPaths, node.uid) || node.task
+                ? node
+                : {...node, unused: isUnused(nodeByUid, node.uid)}),
+            edges: graph.edges.map(edge => ({...edge, unused: isUnused(nodeByUid, edge.target) || isUnused(nodeByUid, edge.source)})),
+        }
+    })
+
+    const graphExecutions = computed<Record<string, Execution>>(() =>
+        Object.fromEntries(
+            [...Object.values(subflowsExecutions.value), ...Object.values(scopedIterations.value)]
+                .flatMap(exec => exec.id ? [[exec.id, exec]] : []),
+        ),
+    )
+
+    const setScopedIterations = (iterations: Record<string, Execution>) => {
+        scopedIterations.value = iterations
+    }
+
+    const loadNamespaces = () => {
+        return ExecutionsAPI.listExecutableDistinctNamespaces()
+            .then(data => {
+                namespaces.value = data
+            })
+    }
+
+    const loadFlowsExecutable = (options: { namespace: string }) => {
+        return ExecutionsAPI.listFlowExecutionsByNamespace({namespace: options.namespace})
+            .then(data => {
+                flowsExecutable.value = data
+            })
+    }
+
+    const loadLatestExecutions = (options: { flowFilters: ExecutionRepositoryInterfaceFlowFilter[] }) => {
+        return ExecutionsAPI.latestExecutions({body: options.flowFilters})
+    }
+
+    const addSubflowExecution = (params: { subflow: string; execution: Execution }) => {
+        subflowsExecutions.value[params.subflow] = params.execution
+    }
+
+    const removeSubflowExecution = (subflow: string) => {
+        delete subflowsExecutions.value[subflow]
+    }
+
+    /** Replaces the event with the same taskRunId and step, since a retry re-emits it, and reassigns
+     *  the array rather than mutating it so shallow watchers see the change. */
+    const addProgressEvent = (event: {taskId: string; taskRunId: string; step: string; timestamp: string}) => {
+        const existingIndex = progressEvents.value.findIndex(e => e.taskRunId === event.taskRunId && e.step === event.step)
+        if (existingIndex === -1) {
+            progressEvents.value = [...progressEvents.value, event]
+        } else {
+            progressEvents.value = progressEvents.value.map((e, i) => i === existingIndex ? event : e)
+        }
+    }
+
+    const resetLogs = () => {
+        logs.value = []
+    }
+
+    const reusedLogsOf = (executionId: string | undefined, level?: LevelFilterValue): LogEntry[] => {
+        if (!executionId) return []
+        return (reusedTaskRuns.value[executionId]?.logs ?? []).filter(log => matchesLevelFilter(log.level, level))
+    }
+
+    const isReusedTaskRun = (executionId: string | undefined, taskRunId: string): boolean => {
+        return !!executionId && !!reusedTaskRuns.value[executionId]?.taskRunIds.includes(taskRunId)
+    }
+
+    const setReusedTaskRuns = (executionId: string, taskRunIds: string[], reusedLogs: LogEntry[]) => {
+        reusedTaskRuns.value = {...reusedTaskRuns.value, [executionId]: {taskRunIds, logs: reusedLogs}}
+    }
+
+    const clearReusedTaskRuns = () => {
+        reusedTaskRuns.value = {}
+    }
+
+    const appendLogs = (entries: LogEntry[]) => {
+        logs.value = logs.value.concat(entries)
+    }
+
+    const appendFollowedLogs = (entry: LogEntry) => {
+        logs.value = [...logs.value, entry]
+    }
+
+    const getFlowExecutions = ({namespace, flowId}: { namespace: string; flowId: string }) => {
+        return ExecutionsAPI.searchExecutionsByFlowId({namespace, flowId}).then(data => {
+            executions.value = data.results
+            total.value = data.total ?? 0
+            return data
+        })
+    }
+
+    const exportExecutionsAsCSV = async (params: FilterQuery) => {
+        const data = await ExecutionsAPI.exportExecutions({filters: routeQueryToQueryFilters(params)}, {headers: {Accept: "text/csv"}, parseAs: "text"})
+        Utils.downloadBlob(new Blob([data as unknown as string]), "executions.csv")
+    }
+
+    return {
+        taskRunSelections,
+        executions,
+        execution,
+        total,
+        logs,
+        subflowsExecutions,
+        scopedIterations,
+        scopedFlowGraph,
+        graphExecutions,
+        progressEvents,
+        flow,
+        flowGraph,
+        namespaces,
+        flowsExecutable,
+        restartExecution,
+        bulkRestartExecution,
+        queryRestartExecution,
+        bulkResumeExecution,
+        queryResumeExecution,
+        bulkReplayExecution,
+        bulkChangeExecutionStatus,
+        queryReplayExecution,
+        queryChangeExecutionStatus,
+        replayExecution,
+        validateReplay,
+        replayExecutionWithInputs,
+        changeExecutionStatus,
+        changeStatus,
+        interrupt,
+        waitForStateChange,
+        kill,
+        bulkKill,
+        queryKill,
+        resume,
+        review,
+        validateReview,
+        cancelApproval,
+        reviewAllowed,
+        isReviewAllowed,
+        resumeFromBreakpoint,
+        validateResume,
+        pause,
+        bulkPauseExecution,
+        queryPauseExecution,
+        loadExecution,
+        findExecutions,
+        findDistinctFieldValues,
+        validateExecution,
+        triggerExecution,
+        deleteExecution,
+        bulkDeleteExecution,
+        queryDeleteExecution,
+        closeSSE,
+        subscribeToExecution,
+        followExecution,
+        followExecutionDependencies,
+        followLogs,
+        loadLogs,
+        downloadLogs,
+        downloadLogsFile,
+        deleteLogs,
+        filePreview,
+        fileContent,
+        setLabels,
+        querySetLabels,
+        bulkSetLabels,
+        unqueue,
+        bulkUnqueueExecution,
+        queryUnqueueExecution,
+        forceRun,
+        bulkForceRunExecution,
+        queryForceRunExecution,
+        loadFlowForExecution,
+        loadFlowForExecutionByExecutionId,
+        loadGraph,
+        loadAugmentedGraph,
+        loadNamespaces,
+        loadFlowsExecutable,
+        loadLatestExecutions,
+        addSubflowExecution,
+        removeSubflowExecution,
+        setScopedIterations,
+        addProgressEvent,
+        resetLogs,
+        reusedLogsOf,
+        isReusedTaskRun,
+        setReusedTaskRuns,
+        clearReusedTaskRuns,
+        appendLogs,
+        appendFollowedLogs,
+        getFlowExecutions,
+        exportExecutionsAsCSV,
+    }
+})

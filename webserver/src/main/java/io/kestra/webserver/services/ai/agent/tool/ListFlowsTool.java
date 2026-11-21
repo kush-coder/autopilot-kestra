@@ -1,0 +1,90 @@
+package io.kestra.webserver.services.ai.agent.tool;
+
+import java.util.List;
+
+import io.kestra.core.ai.agent.models.AgentToolFamily;
+import io.kestra.core.ai.agent.models.AgentWritePolicy;
+import io.kestra.core.mcp.models.McpToolAnnotations;
+import io.kestra.core.models.QueryFilter;
+import io.kestra.core.models.flows.Flow;
+import io.kestra.core.repositories.FlowRepositoryInterface;
+import io.kestra.webserver.converters.QueryFilterFormat;
+import io.kestra.webserver.services.ai.agent.AgentCallContext;
+import io.kestra.webserver.utils.PageableUtils;
+
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+/**
+ * Read-only agent tool listing flows matching per-field query filters, one compact line per flow.
+ */
+@Singleton
+public class ListFlowsTool implements McpPlatformTool {
+    private static final int MAX_RESULTS = 50;
+    private static final int MAX_DESCRIPTION_LENGTH = 120;
+
+    private final FlowRepositoryInterface flowRepository;
+
+    @Inject
+    public ListFlowsTool(final FlowRepositoryInterface flowRepository) {
+        this.flowRepository = flowRepository;
+    }
+
+    @Override
+    public AgentToolFamily family() {
+        return AgentToolFamily.READ;
+    }
+
+    @Override
+    public AgentWritePolicy writePolicy() {
+        return AgentWritePolicy.AUTO;
+    }
+
+    @Override
+    public McpToolAnnotations annotations() {
+        return McpToolAnnotations.READ_ONLY;
+    }
+
+    @Tool(
+        name = "list_flows",
+        value = "List Kestra flows matching the given per-field filters (" + MAX_RESULTS + " per page). Read-only; use this to discover flows before reading one with read_flow, or to count them. "
+            + "Returns an object { flows, total, page } where `flows` is an array of { namespace, id, description } (empty when nothing matches); long descriptions are truncated. "
+            + "`total` is the number of all matching flows; when it exceeds what was read so far, request the next `page`."
+    )
+    public Result listFlows(
+        @QueryFilterFormat(QueryFilter.Resource.FLOW) List<QueryFilter> filters,
+        @P(name = "page", value = "The 1-based page to read; omit for the first page", required = false) Integer page,
+        final AgentCallContext.Context context) {
+        String tenant = context.tenant();
+        int pageNumber = ToolPages.pageNumber(page);
+
+        var flows = flowRepository.find(PageableUtils.from(pageNumber, MAX_RESULTS), tenant, filters);
+
+        return new Result(
+            flows.stream()
+                .map(ListFlowsTool::toSummary)
+                .toList(),
+            flows.getTotal(),
+            pageNumber
+        );
+    }
+
+    private static FlowSummary toSummary(final Flow flow) {
+        String description = flow.getDescription() == null || flow.getDescription().isBlank()
+            ? null
+            : truncate(flow.getDescription());
+        return new FlowSummary(flow.getNamespace(), flow.getId(), description);
+    }
+
+    private static String truncate(final String text) {
+        return text.length() <= MAX_DESCRIPTION_LENGTH ? text : text.substring(0, MAX_DESCRIPTION_LENGTH) + "…";
+    }
+
+    public record Result(List<FlowSummary> flows, long total, int page) {
+    }
+
+    public record FlowSummary(String namespace, String id, String description) {
+    }
+}

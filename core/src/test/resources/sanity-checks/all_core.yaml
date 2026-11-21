@@ -1,0 +1,43 @@
+id: all_core
+namespace: sanitychecks.core
+
+tasks:
+  - id: loop
+    type: io.kestra.plugin.core.flow.Loop
+    concurrencyLimit: 1
+    values:
+      - allow_failure
+      - dag
+      - fail
+      - if
+      - ion_binary
+      - kv
+      - labels
+      - log
+      - loop_conditional
+      - loop_errors_finally
+      - loop_json_objects
+      - loop_nested
+      - loop_outputs_basic
+      - loop_parallel
+      - loop_simple_list
+      - namespace_files
+      - output_values
+      - parallel
+      - pause-test
+      - purge_current_execution_files
+      - purge_kv
+      - purge_storage
+      - request
+      - request-basicauth
+      - request_no_options
+      - return
+      - sequential
+      - sleep
+      - switch
+      - write
+    tasks:
+      - id: subflow
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: "{{ item.value }}"
+        namespace: "{{ flow.namespace }}"

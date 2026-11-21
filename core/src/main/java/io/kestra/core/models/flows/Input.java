@@ -1,0 +1,184 @@
+package io.kestra.core.models.flows;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
+import io.kestra.core.models.flows.input.*;
+import io.kestra.core.models.property.Property;
+import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.validations.InputValidation;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.experimental.SuperBuilder;
+
+@SuperBuilder
+@Getter
+@NoArgsConstructor
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type", visible = true, include = JsonTypeInfo.As.EXISTING_PROPERTY)
+@JsonSubTypes(
+    {
+        @JsonSubTypes.Type(value = ArrayInput.class, name = "ARRAY"),
+        @JsonSubTypes.Type(value = BoolInput.class, name = "BOOL"),
+        @JsonSubTypes.Type(value = DateInput.class, name = "DATE"),
+        @JsonSubTypes.Type(value = DateTimeInput.class, name = "DATETIME"),
+        @JsonSubTypes.Type(value = DurationInput.class, name = "DURATION"),
+        @JsonSubTypes.Type(value = FileInput.class, name = "FILE"),
+        @JsonSubTypes.Type(value = FloatInput.class, name = "FLOAT"),
+        @JsonSubTypes.Type(value = IntInput.class, name = "INT"),
+        @JsonSubTypes.Type(value = JsonInput.class, name = "JSON"),
+        @JsonSubTypes.Type(value = IonInput.class, name = "ION"),
+        @JsonSubTypes.Type(value = SecretInput.class, name = "SECRET"),
+        @JsonSubTypes.Type(value = StringInput.class, name = "STRING"),
+        @JsonSubTypes.Type(value = SelectInput.class, name = "SELECT"),
+        @JsonSubTypes.Type(value = TimeInput.class, name = "TIME"),
+        @JsonSubTypes.Type(value = URIInput.class, name = "URI"),
+        @JsonSubTypes.Type(value = MultiselectInput.class, name = "MULTISELECT"),
+        @JsonSubTypes.Type(value = YamlInput.class, name = "YAML"),
+        @JsonSubTypes.Type(value = EmailInput.class, name = "EMAIL"),
+        @JsonSubTypes.Type(value = FormInput.class, name = "FORM"),
+        @JsonSubTypes.Type(value = ReusableInputsInput.class, name = "REUSABLE_INPUTS"),
+        @JsonSubTypes.Type(value = TableInput.class, name = "TABLE"),
+        @JsonSubTypes.Type(value = AssetInput.class, name = "ASSET"),
+    }
+)
+@InputValidation
+public abstract class Input<T> implements Data {
+    /**
+     * The types of input that can be searchable: a scalar value or an array of scalar values.
+     */
+    public static final Set<Type> SEARCHABLE_TYPES = Collections.unmodifiableSet(EnumSet.of(
+        Type.STRING, Type.EMAIL, Type.SELECT, Type.INT, Type.BOOL, Type.FLOAT, Type.URI, Type.DATETIME, Type.DATE, Type.TIME, Type.DURATION, Type.ARRAY
+    ));
+
+    @Schema(
+        title = "The ID of the input."
+    )
+    @NotNull
+    @NotBlank
+    @Pattern(regexp = "^[a-zA-Z0-9][.a-zA-Z0-9_-]*")
+    String id;
+
+    @Schema(
+        title = "The type of the input."
+    )
+    @NotNull
+    @Valid
+    Type type;
+
+    @Schema(
+        title = "The description of the input."
+    )
+    String description;
+
+    @Schema(
+        title = "How the description of the input is displayed.",
+        description = "`TEXT` renders the description as a text block between the label and the field, `TOOLTIP` renders it as a hoverable icon next to the label. Defaults to `TEXT`."
+    )
+    DescriptionDisplayMode descriptionDisplayMode;
+
+    @Schema(
+        title = "The dependencies of the input."
+    )
+    DependsOn dependsOn;
+
+    @Schema(
+        title = "Whether the input is required."
+    )
+    @Builder.Default
+    Boolean required = true;
+
+    @Schema(
+        title = "The default value to use if no value is specified."
+    )
+    Property<T> defaults;
+
+    @Schema(
+        title = "Whether the input is searchable.",
+        description = """
+            A searchable input will be stored in a separate table with its own index, and available for search via the **Inputs & Outputs** filter.
+            By default, an input is not searchable.
+            """
+    )
+    Boolean searchable;
+
+    @Schema(
+        title = "The suggested value for the input.",
+        description = "Optional UI hint for pre-filling the input. Cannot be used together with a default value."
+    )
+    Property<T> prefill;
+
+    @Schema(
+        title = "The display name of the input."
+    )
+    String displayName;
+
+    public abstract void validate(T input) throws ConstraintViolationException;
+
+    /** Returns a copy with a different description, preserving the concrete input type. */
+    public Input<?> withDescription(String description) {
+        return copyWith(this, "description", description);
+    }
+
+    /**
+     * Expands every {@link io.kestra.core.models.flows.input.FormInput} into copies of its children whose id is
+     * rewritten to the dotted path ({@code environment} + {@code .} + {@code region} -> {@code environment.region}).
+     * <p>
+     * The resolution core keys inputs by {@link #getId()} and reassembles dotted keys into a nested map via
+     * {@link io.kestra.core.utils.MapUtils#flattenToNestedMap(java.util.Map)}, so a leaf carrying the dotted id is all
+     * that is needed for the nested payload to materialize. {@code dependsOn} is intentionally NOT rewritten — authors
+     * reference siblings by their full dotted path; an unresolved bare ref is rejected loudly by flow validation.
+     * Forms cannot be nested (enforced by validation), so expansion is single-level.
+     *
+     * @return a flat list of leaf inputs with no {@code FORM} node surviving, or the input list unchanged when null/empty.
+     */
+    public static List<Input<?>> expandToLeaves(List<Input<?>> inputs) {
+        if (inputs == null || inputs.isEmpty()) {
+            return inputs;
+        }
+
+        List<Input<?>> leaves = new ArrayList<>();
+        for (Input<?> input : inputs) {
+            if (input instanceof io.kestra.core.models.flows.input.FormInput form) {
+                if (form.getInputs() != null) {
+                    for (Input<?> child : form.getInputs()) {
+                        leaves.add(copyWith(child, "id", form.getId() + "." + child.getId()));
+                    }
+                }
+            } else {
+                leaves.add(input);
+            }
+        }
+        return leaves;
+    }
+
+    /** Copies a field through Jackson so the concrete input subtype is preserved without a base-class builder. */
+    private static Input<?> copyWith(Input<?> input, String field, Object value) {
+        Map<String, Object> map = JacksonMapper.toMap(input);
+        map.put(field, value);
+        return JacksonMapper.toMap(map, Input.class);
+    }
+
+    /**
+     * @return all expanded leaf paths (e.g. {@code environment.region}, {@code credentials.api_key}, {@code api_key}),
+     *         used by uniqueness validation to reject duplicate paths and prefix conflicts.
+     */
+    public static List<String> collectExpandedPaths(List<Input<?>> inputs) {
+        List<Input<?>> expanded = expandToLeaves(inputs);
+        return expanded == null ? List.of() : expanded.stream().map(Input::getId).toList();
+    }
+}
